@@ -1,0 +1,487 @@
+---
+title: "FSPLS_binary_datasets"
+author: "Daniel Rawlinson"
+date: "2024-04-16"
+output: html_document
+---
+
+#Load libraries
+```{r setup}
+library(magrittr)
+library(ROCR)
+library(glmnet)
+library(mRMRe)
+library(nnet)
+library(caret)
+library(dplyr)
+library(GEOquery)
+
+```
+
+#Load code
+```{r}
+source('/home/danrawlinson/git/fspls/fspls_lachlan/fspls.R')
+pv_thresh = 0.01
+refit=FALSE
+```
+
+
+#Golub analysis
+```{r}
+family = 'binomial'
+measure = 'auc'
+options('family' = family)
+
+golub_dat <- readRDS('../input/golub_data/golub.prepd.Rds')
+golub_merged_x <- golub_dat$data
+golub_merged_y <- golub_dat$y
+
+kfold_results <- list(
+    'lasso' = data.frame('lambda' = numeric(), 'nfeatures' = numeric(), 'train_auc' = numeric(), 'test_auc' = numeric(), 'nsamples_test' = numeric()),
+    'elastic_net' = data.frame('lambda' = numeric(), 'nfeatures' = numeric(), 'train_auc' = numeric(),'test_auc' = numeric(), 'nsamples_test' = numeric()),
+    'fspls' = data.frame('nfeatures' = numeric(), 'train_auc' = numeric(), 'test_auc' = numeric(), 'feature_ids' = character(), 'nsamples_test' = numeric()),
+    'mrmr' = data.frame('nfeatures' = numeric(), 'train_auc' = numeric(), 'test_auc' = numeric(), 'feature_ids' = character(), 'nsamples_test' = numeric()))
+
+set.seed(42)
+folds <- caret::createFolds(golub_merged_y$x, k = 5)
+fspls_model_golub_fold_list = list()
+
+fspls_test_auc <- list()
+fspls_train_auc <- list()
+
+
+for (i in 1:length(folds)) {
+  train_idx <- folds[-i] %>% unlist()
+  test_idx <- folds[[i]]
+  
+
+  trainx <- golub_merged_x[train_idx,] %>% scale()
+  trainy <- golub_merged_y[train_idx,] 
+  
+  testx <- golub_merged_x[test_idx,] %>% scale()
+  testy <- golub_merged_y[test_idx,]
+  
+  #FS-PLS
+  fspls_fold_data <- list(data = as.matrix(trainx), y = as.matrix(trainy))
+  fspls_test_data <- list(data = as.matrix(testx), y = as.matrix(testy))
+  #family is inferred from getOption. Think it's wiser to set family as an argument.
+  fspls_model_golub_fold_list[[i]] <- trainModel(trainOriginal = fspls_fold_data, pv_thresh = pv_thresh, testOriginal = fspls_test_data, refit =refit, max = 15)
+
+  #choose best number of features
+  evals <- fspls_model_golub_fold_list[[i]]$eval[2:(length(fspls_model_golub_fold_list[[i]]$variables)+1),3]
+  n_variables = which(evals == max(evals))[1]
+  
+
+  #re-evaluate
+  #get pred probs
+  test_preds <- pred(fspls_model_golub_fold_list[[i]]$beta[1:n_variables], fspls_model_golub_fold_list[[i]]$variables[1:n_variables], fspls_test_data, fspls_model_golub_fold_list[[i]]$Wall[1:n_variables, 1:n_variables], fspls_model_golub_fold_list[[i]]$constantTerm, fspls_model_golub_fold_list[[i]]$means[1:n_variables])
+
+train_preds <- pred(fspls_model_golub_fold_list[[i]]$beta[1:n_variables], fspls_model_golub_fold_list[[i]]$variables[1:n_variables], fspls_fold_data, fspls_model_golub_fold_list[[i]]$Wall[1:n_variables, 1:n_variables], fspls_model_golub_fold_list[[i]]$constantTerm, fspls_model_golub_fold_list[[i]]$means[1:n_variables])
+
+  #get AUC
+  fspls_test_auc[[i]] <- pROC::roc(as.numeric(fspls_test_data$y), test_preds, auc = T, ci= T) #these results show that the RHS in the model$eval is indeed the test results
+  fspls_train_auc[[i]] <- pROC::roc(as.numeric(fspls_fold_data$y),train_preds, auc = T, ci= T) #and the LHS of model$eval is indeed the train auc
+  #fspls' = data.frame('nfeatures' = numeric(), 'train_auc' = numeric(), 'test_auc' = numeric(), 'feature_ids' = character(), 'nsamples_test' = numeric())
+  
+  fspls_n_best_features <- n_variables
+  fspls_best_feature_list <- colnames(testx)[fspls_model_golub_fold_list[[i]]$variables[1:n_variables]]
+
+  kfold_results$fspls[i,] = c(fspls_n_best_features,  
+                              as.numeric(fspls_train_auc[[i]]$auc), 
+                              as.numeric(fspls_test_auc[[i]]$auc),  
+                              paste(fspls_best_feature_list,collapse=';'), 
+                              length(testy))
+
+  
+  #LASSO
+  
+  lasso_cv <- cv.glmnet(trainx, trainy, type.measure = measure, family = family, nfolds = 5)
+  #eval_lasso <- assess.glmnet(lasso_cv, newx = testx, newy = testy)
+  
+  lasso_test_preds <- predict(lasso_cv, newx = testx, s = 'lambda.1se')
+  lasso_test_auc <- pROC::roc(as.numeric(testy), as.numeric(lasso_test_preds), ci = T, auc = T)
+  #lasso_test_auc <- pROC::roc(as.numeric(testy[,'sbp']), as.numeric(lasso_test_preds))
+  
+  lasso_train_preds <- predict(lasso_cv, newx = trainx, s="lambda.1se")
+  lasso_train_auc <- pROC::roc(as.numeric(trainy), as.numeric(lasso_train_preds), ci = T, auc = T)
+    
+  kfold_results$lasso[i,] = c(lasso_cv$lambda.1se,  
+                              lasso_cv$nzero[lasso_cv$index['1se',]], 
+                              as.numeric(lasso_train_auc$auc),  
+                              as.numeric(lasso_test_auc$auc), 
+                              length(testy))
+  
+  #elastic net
+  elasticnet_cv <- cv.glmnet(trainx, trainy, type.measure = measure, family = family, nfolds = 5, alpha = 0.5)
+  #eval_enet <- assess.glmnet(elasticnet_cv, newx = testx, newy = testy)
+  
+  enet_test_preds <- predict(elasticnet_cv, newx  = testx, s = 'lambda.1se')
+  #enet_test_auc <- pROC::roc(as.numeric(testy), as.numeric(enet_test_preds))
+  enet_test_auc<- pROC::roc(as.numeric(testy), as.numeric(enet_test_preds), ci = T, auc = T)
+  
+  enet_train_preds <- predict(elasticnet_cv, newx = trainx, s="lambda.1se")
+  #enet_train_auc <- pROC::roc(as.numeric(trainy), as.numeric(enet_train_preds))
+  enet_train_auc <- pROC::roc(as.numeric(trainy), as.numeric(lasso_train_preds), ci = T, auc = T)
+  
+  kfold_results$elastic_net[i,] = c(elasticnet_cv$lambda.1se,  
+                                    elasticnet_cv$nzero[elasticnet_cv$index['1se',]], 
+                                    as.numeric(enet_train_auc$auc),  
+                                    as.numeric(enet_test_auc$auc), 
+                                    length(testy))
+
+  #mRMR
+  mrmr_train_fold <- cbind(trainx, target  = as.numeric(trainy)) %>% as.data.frame()
+  mr.d <- mRMR.data(mrmr_train_fold)
+  mr_out <- mRMR.classic(mr.d, target_indices = c(length(mrmr_train_fold)), feature_count = fspls_n_best_features) #num of features from fspls
+  
+  mrmr_selected <- mrmr_train_fold[,solutions(mr_out)[[1]]]
+
+  if (is.null(dim(mrmr_selected))) {
+    subset_x_data_test <- cbind(testx[,solutions(mr_out)[[1]]], 1)
+    mrmr_selected <- cbind(mrmr_selected, 1) #add ones in case of just one feature being selected
+    colnames(mrmr_selected)[1] <- colnames(mrmr_train_fold)[solutions(mr_out)[[1]]]
+  } else {
+    subset_x_data_test <- testx[,colnames(mrmr_selected)]
+  }
+  
+  #regress
+   mrmr_ridge <- cv.glmnet(x = as.matrix(mrmr_selected), y = as.factor(trainy), family = family, alpha = 0, type.measure = measure, nfolds = 5) 
+  
+  #get test and train auc
+  #eval_mrmr <- assess.glmnet(mrmr_ridge, newx = testx[,colnames(mrmr_selected)], newy = testy)
+  mrmr_test_preds <- predict(mrmr_ridge, newx =  subset_x_data_test, s = 'lambda.1se')
+  mrmr_test_auc <- pROC::roc(as.numeric(testy), as.numeric(mrmr_test_preds))
+  
+  mrmr_train_preds <- predict(mrmr_ridge, newx = as.matrix(mrmr_selected), s="lambda.1se")
+  mrmr_train_auc <- pROC::roc(as.numeric(trainy), as.numeric(mrmr_train_preds))
+  
+  kfold_results$mrmr[i,] = c(length(solutions(mr_out)[[1]]),
+                         as.numeric(mrmr_train_auc$auc),
+                         as.numeric(mrmr_test_auc$auc),
+                         paste(colnames(mrmr_selected), collapse = ';'),
+                         length(testy))
+}
+
+saveRDS(kfold_results, file = 'output/golub_kfold_results.Rds')
+```
+
+#Kaforou data
+```{r}
+family = 'binomial'
+measure = 'auc'
+options('family' = family)
+
+kaf_data <- readRDS('input/kaforou_data/kaforou_data.prepd.Rds')
+kaf_normalised <- t(kaf_data$data)
+kaf_TB_samples <- kaf_data$TB_idx
+kaf_y <- kaf_data$y
+
+#most variable features
+vars_X <- kaf_normalised[,kaf_TB_samples] %>% {apply(., 1, var)} %>% sort(decreasing = T)
+
+set.seed(42)
+folds <- caret::createFolds(y = kaf_TB_samples, k = 5)  
+
+fspls_model_kaf_fold_list = list()
+fspls_test_auc <- list()
+fspls_train_auc <- list()
+
+for (i in 1:length(folds)) {
+  train_idx <- folds[-i] %>% unlist()
+  test_idx <- folds[[i]]
+  
+
+  trainx <- kaf_normalised[,train_idx] %>% t() %>% scale()
+  trainy <- model.matrix(~as.factor(kaf_y[kaf_TB_samples]))[,2][train_idx]
+  
+  #var_sigs determined prior to fold splitting
+  #var_sigs <- apply(trainx, 2, function(x) glm(trainy ~ x) %>% {summary(.)$coefficients[2,4] })
+  
+  #trainx <- trainx[,var_sigs < 0.05]
+  trainx <- trainx[,names(vars_X)[1:10000]]
+  
+  testx <- kaf_normalised[,test_idx] %>% t() %>% scale()
+  testy <- model.matrix(~as.factor(kaf_y[kaf_TB_samples]))[,2][test_idx]
+  
+  #testx <- testx[,var_sigs < 0.05]
+  testx <- testx[,names(vars_X)[1:10000]]
+  #FS-PLS
+  fspls_fold_data <- list(data = as.matrix(trainx), y = as.matrix(trainy))
+  fspls_test_data <- list(data = as.matrix(testx), y = as.matrix(testy))
+  #family is inferred from getOption. Think it's wiser to set family as an argument.
+  fspls_model_kaf_fold_list[[i]] <- trainModel(trainOriginal = fspls_fold_data, pv_thresh = pv_thresh, testOriginal = fspls_test_data, refit =refit, max = 15)
+
+  #re-evaluate
+  #get pred probs
+  test_preds <- pred(fspls_model_kaf_fold_list[[i]]$beta, fspls_model_kaf_fold_list[[i]]$variables, fspls_test_data)
+  train_preds <- pred(fspls_model_kaf_fold_list[[i]]$beta, fspls_model_kaf_fold_list[[i]]$variables, fspls_fold_data)
+  #get AUC
+  fspls_test_auc[[i]] <- pROC::roc(as.numeric(fspls_test_data$y), test_preds, auc = T, ci= T) #these results show that the RHS in the model$eval is indeed the test results
+  fspls_train_auc[[i]] <- pROC::roc(as.numeric(fspls_fold_data$y),train_preds, auc = T, ci= T) #and the LHS of model$eval is indeed the train auc
+  #fspls' = data.frame('nfeatures' = numeric(), 'train_auc' = numeric(), 'test_auc' = numeric(), 'feature_ids' = character(), 'nsamples_test' = numeric())
+  
+  fspls_n_best_features <- length(fspls_model_kaf_fold_list[[i]]$variables)
+  fspls_best_feature_list <- colnames(testx)[fspls_model_kaf_fold_list[[i]]$variables]
+
+  kfold_results$fspls[i,] = c(fspls_n_best_features,  
+                              as.numeric(fspls_train_auc[[i]]$auc), 
+                              as.numeric(fspls_test_auc[[i]]$auc),  
+                              paste(fspls_best_feature_list,collapse=';'), 
+                              length(testy))
+
+  
+  #LASSO
+  
+  lasso_cv <- cv.glmnet(trainx, trainy, type.measure = measure, family = family, nfolds = 5)
+  #eval_lasso <- assess.glmnet(lasso_cv, newx = testx, newy = testy)
+  
+  lasso_test_preds <- predict(lasso_cv, newx = testx, s = 'lambda.1se')
+  lasso_test_auc<- pROC::roc(as.numeric(testy), as.numeric(lasso_test_preds), ci = T, auc = T)
+  #lasso_test_auc <- pROC::roc(as.numeric(testy[,'sbp']), as.numeric(lasso_test_preds))
+  
+  lasso_train_preds <- predict(lasso_cv, newx = trainx, s="lambda.1se")
+  lasso_train_auc <- pROC::roc(as.numeric(trainy), as.numeric(lasso_train_preds), ci = T, auc = T)
+    
+  kfold_results$lasso[i,] = c(lasso_cv$lambda.1se,  
+                              lasso_cv$nzero[lasso_cv$index['1se',]], 
+                              as.numeric(lasso_train_auc$auc),  
+                              as.numeric(lasso_test_auc$auc), 
+                              length(testy))
+  
+  #elastic net
+  elasticnet_cv <- cv.glmnet(trainx, trainy, type.measure = measure, family = family, nfolds = 5, alpha = 0.5)
+  #eval_enet <- assess.glmnet(elasticnet_cv, newx = testx, newy = testy)
+  
+  enet_test_preds <- predict(elasticnet_cv, newx  = testx, s = 'lambda.1se')
+  #enet_test_auc <- pROC::roc(as.numeric(testy), as.numeric(enet_test_preds))
+  enet_test_auc<- pROC::roc(as.numeric(testy), as.numeric(enet_test_preds), ci = T, auc = T)
+  
+  enet_train_preds <- predict(elasticnet_cv, newx = trainx, s="lambda.1se")
+  #enet_train_auc <- pROC::roc(as.numeric(trainy), as.numeric(enet_train_preds))
+  enet_train_auc <- pROC::roc(as.numeric(trainy), as.numeric(lasso_train_preds), ci = T, auc = T)
+  
+  kfold_results$elastic_net[i,] = c(elasticnet_cv$lambda.1se,  
+                                    elasticnet_cv$nzero[elasticnet_cv$index['1se',]], 
+                                    as.numeric(enet_train_auc$auc),  
+                                    as.numeric(enet_test_auc$auc), 
+                                    length(testy))
+
+  #mRMR
+  #mrmr_train_fold <- cbind(trainx[,names(trimmed_vars)], target  = as.numeric(trainy)) %>% as.data.frame()
+  #not reducing to trimmed vars because I'm filtering the whole set of features instead to speed it up
+  mrmr_train_fold <- cbind(trainx, target  = as.numeric(trainy)) %>% as.data.frame()
+  mr.d <- mRMR.data(mrmr_train_fold)
+  mr_out <- mRMR.classic(mr.d, target_indices = c(length(mrmr_train_fold)), feature_count = fspls_n_best_features) #num of features from fspls
+  
+  mrmr_selected <- mrmr_train_fold[,solutions(mr_out)[[1]]]
+
+  if (is.null(dim(mrmr_selected))) {
+    subset_x_data_test <- cbind(testx[,solutions(mr_out)[[1]]], 1)
+    mrmr_selected <- cbind(mrmr_selected, 1) #add ones in case of just one feature being selected
+    colnames(mrmr_selected)[1] <- colnames(mrmr_train_fold)[solutions(mr_out)[[1]]]
+  } else {
+    subset_x_data_test <- testx[,colnames(mrmr_selected)]
+  }
+  
+  #regress
+   mrmr_ridge <- cv.glmnet(x = as.matrix(mrmr_selected), y = as.factor(trainy), family = family, alpha = 0, type.measure = measure, nfolds = 5) 
+  
+  #get test and train auc
+  #eval_mrmr <- assess.glmnet(mrmr_ridge, newx = testx[,colnames(mrmr_selected)], newy = testy)
+  mrmr_test_preds <- predict(mrmr_ridge, newx =  subset_x_data_test, s = 'lambda.1se')
+  mrmr_test_auc <- pROC::roc(as.numeric(testy), as.numeric(mrmr_test_preds))
+  
+  mrmr_train_preds <- predict(mrmr_ridge, newx = as.matrix(mrmr_selected), s="lambda.1se")
+  mrmr_train_auc <- pROC::roc(as.numeric(trainy), as.numeric(mrmr_train_preds))
+  
+  kfold_results$mrmr[i,] = c(length(solutions(mr_out)[[1]]),
+                         as.numeric(mrmr_train_auc$auc),
+                         as.numeric(mrmr_test_auc$auc),
+                         paste(colnames(mrmr_selected), collapse = ';'),
+                         length(testy))
+}
+
+saveRDS(kfold_results, 'output/kaforou_kfold_results.Rds')
+```
+
+#Ng data
+```{r}
+ng_data <- readRDS('input/ng_data/ng_data.prepd.Rds')
+ng_X <- ng_data$data
+ng_y <- ng_data$y
+
+family = 'binomial'
+measure = 'auc'
+options('family' = family)
+
+set.seed(42)
+folds <- caret::createFolds(y = ng_y, k = 5)
+
+#features expressed in < 20% of samples
+# feature_rarity <- apply(ng_X, 2, function(x) {
+#   samps_with_expression <- sum(x>0)
+#     pct_samps_expressed <- samps_with_expression/length(x)
+#     return(pct_samps_expressed)
+# } )
+# remove_features <- which(feature_rarity < 0.2)
+
+vars_X <- ng_data$data %>% log1p() %>% {apply(., 2, var)} %>% sort(decreasing = T)
+
+#init results list
+kfold_results <- list('lasso' = data.frame('lambda' = numeric(), 'nfeatures' = numeric(), 'train_auc' = numeric(), 'test_auc' = numeric(), 'nsamples_test' = numeric()),
+                      'elastic_net' = data.frame('lambda' = numeric(), 'nfeatures' = numeric(), 'train_auc' = numeric(),'test_auc' = numeric(), 'nsamples_test' = numeric()),
+                      'fspls' = data.frame('nfeatures' = numeric(), 'train_auc' = numeric(), 'test_auc' = numeric(), 'feature_ids' = character(), 'nsamples_test' = numeric()),
+                      'mrmr' = data.frame('nfeatures' = numeric(), 'train_auc' = numeric(), 'test_auc' = numeric(), 'feature_ids' = character(), 'nsamples_test' = numeric()))
+
+fspls_model_kaf_fold_list = list()
+
+fspls_test_auc <- list()
+fspls_train_auc <- list()
+
+for (i in 1:length(folds)) {
+  train_idx <- folds[-i] %>% unlist()
+  test_idx <- folds[[i]]
+
+  #lib size normalisation
+  trainx_unnormalised <- ng_X[train_idx,]
+  ng_million_lib_sizes_train <- apply(trainx_unnormalised, 1, sum) / 1e6
+  ng_tpms_train <- sweep(trainx_unnormalised, 1, STATS = ng_million_lib_sizes_train, FUN = '/')
+  #trainx <- ng_tpms_train[,-remove_features] %>% log1p()
+  trainx <- ng_tpms_train[,names(vars_X)[1:10000]] %>% log1p()
+
+  
+  trainy <- ng_y[train_idx]
+  
+  testx_unnormalised <- ng_X[test_idx,]
+  ng_million_lib_sizes_test <- apply(testx_unnormalised, 1, sum) / 1e6
+  ng_tpms_test <- sweep(testx_unnormalised, 1, STATS = ng_million_lib_sizes_test, FUN = '/')
+  #testx <- ng_tpms_test[,-remove_features]  %>% log1p()
+  testx <- ng_tpms_test[,names(vars_X)[1:10000]] %>% log1p()
+  
+  testy <- ng_y[test_idx]
+  
+  #FS-PLS
+  fspls_fold_data <- list(data = as.matrix(trainx), y = as.matrix(trainy))
+  fspls_test_data <- list(data = as.matrix(testx), y = as.matrix(testy))
+  #family is inferred from getOption. Think it's wiser to set family as an argument.
+  model_fspls <- trainModel(trainOriginal = fspls_fold_data, pv_thresh = pv_thresh, testOriginal = fspls_test_data, refit =refit, max = 15)
+
+  fspls_model_kaf_fold_list[[i]] <- model_fspls
+  #which variable number to choose? Borrowing from glmnet's 1se idea
+  met = measure
+  metric_col <- which(c('rms','auc','acc', 'dev') == met)
+  train_col_metric <- metric_col + 1
+  test_col_metric <- train_col_metric + 5
+  
+  evals <- model_fspls$eval[2:(length(model_fspls$variables)+1),train_col_metric] #index for corresponds to trainig accuracy
+
+  eval_min <- max(evals)
+  eval_se <- sd(evals)
+  if (length(model_fspls$variables) < 3) {
+    tolerable_acc = eval_min
+  } else{
+      tolerable_acc <- eval_min - eval_se
+  }
+  n_variables_min= which(evals == eval_min)[1]
+  n_variables_1se = which(evals >= tolerable_acc)[1]
+  
+  #set this to min or 1se depending on which you want to report on
+  n_variables_chosen = n_variables_min
+  
+  #re-evaluate
+  #get pred probs
+  test_preds <- pred(fspls_model_kaf_fold_list[[i]]$beta[1:n_variables_chosen], fspls_model_kaf_fold_list[[i]]$variables[1:n_variables_chosen], fspls_test_data, Wall = fspls_model_kaf_fold_list[[i]]$Wall[1:n_variables_chosen,1:n_variables_chosen], const = fspls_model_kaf_fold_list[[i]]$constantTerm, means = fspls_model_kaf_fold_list[[i]]$means[1:n_variables_chosen])
+  
+  train_preds <- pred(fspls_model_kaf_fold_list[[i]]$beta[1:n_variables_chosen], fspls_model_kaf_fold_list[[i]]$variables[1:n_variables_chosen], fspls_fold_data, Wall = fspls_model_kaf_fold_list[[i]]$Wall[1:n_variables_chosen,1:n_variables_chosen], const = fspls_model_kaf_fold_list[[i]]$constantTerm, means = fspls_model_kaf_fold_list[[i]]$means[1:n_variables_chosen])
+  
+  #get AUC
+  fspls_test_auc[[i]] <- pROC::roc(as.numeric(fspls_test_data$y), test_preds, auc = T, ci= T) #these results show that the RHS in the model$eval is indeed the test results
+  fspls_train_auc[[i]] <- pROC::roc(as.numeric(fspls_fold_data$y),train_preds, auc = T, ci= T) #and the LHS of model$eval is indeed the train auc
+  #fspls' = data.frame('nfeatures' = numeric(), 'train_auc' = numeric(), 'test_auc' = numeric(), 'feature_ids' = character(), 'nsamples_test' = numeric())
+  
+  fspls_n_best_features <- length(fspls_model_kaf_fold_list[[i]]$variables[1:n_variables_chosen])
+  fspls_best_feature_list <- colnames(testx)[fspls_model_kaf_fold_list[[i]]$variables[1:n_variables_chosen]]
+
+  kfold_results$fspls[i,] = c(fspls_n_best_features,  
+                              as.numeric(fspls_train_auc[[i]]$auc), 
+                              as.numeric(fspls_test_auc[[i]]$auc),  
+                              paste(fspls_best_feature_list,collapse=';'), 
+                              length(testy))
+
+  
+  #LASSO
+  
+  lasso_cv <- cv.glmnet(trainx, trainy, type.measure = measure, family = family, nfolds = 5)
+  #eval_lasso <- assess.glmnet(lasso_cv, newx = testx, newy = testy)
+  
+  lasso_test_preds <- predict(lasso_cv, newx = testx, s = 'lambda.1se')
+  lasso_test_auc<- pROC::roc(as.numeric(testy), as.numeric(lasso_test_preds), ci = T, auc = T)
+  #lasso_test_auc <- pROC::roc(as.numeric(testy[,'sbp']), as.numeric(lasso_test_preds))
+  
+  lasso_train_preds <- predict(lasso_cv, newx = trainx, s="lambda.1se")
+  lasso_train_auc <- pROC::roc(as.numeric(trainy), as.numeric(lasso_train_preds), ci = T, auc = T)
+    
+  kfold_results$lasso[i,] = c(lasso_cv$lambda.1se,  
+                              lasso_cv$nzero[lasso_cv$index['1se',]], 
+                              as.numeric(lasso_train_auc$auc),  
+                              as.numeric(lasso_test_auc$auc), 
+                              length(testy))
+  
+  #elastic net
+  elasticnet_cv <- cv.glmnet(trainx, trainy, type.measure = measure, family = family, nfolds = 5, alpha = 0.5)
+  #eval_enet <- assess.glmnet(elasticnet_cv, newx = testx, newy = testy)
+  
+  enet_test_preds <- predict(elasticnet_cv, newx  = testx, s = 'lambda.1se')
+  #enet_test_auc <- pROC::roc(as.numeric(testy), as.numeric(enet_test_preds))
+  enet_test_auc<- pROC::roc(as.numeric(testy), as.numeric(enet_test_preds), ci = T, auc = T)
+  
+  enet_train_preds <- predict(elasticnet_cv, newx = trainx, s="lambda.1se")
+  #enet_train_auc <- pROC::roc(as.numeric(trainy), as.numeric(enet_train_preds))
+  enet_train_auc <- pROC::roc(as.numeric(trainy), as.numeric(lasso_train_preds), ci = T, auc = T)
+  
+  kfold_results$elastic_net[i,] = c(elasticnet_cv$lambda.1se,  
+                                    elasticnet_cv$nzero[elasticnet_cv$index['1se',]], 
+                                    as.numeric(enet_train_auc$auc),  
+                                    as.numeric(enet_test_auc$auc), 
+                                    length(testy))
+
+  #mRMR
+  #mrmr_train_fold <- cbind(trainx[,names(trimmed_vars)], target  = as.numeric(trainy)) %>% as.data.frame()
+  #not reducing to trimmed vars because I'm filtering the whole set of features instead to speed it up
+  mrmr_train_fold <- cbind(trainx, target = as.numeric(trainy)) %>% as.data.frame()
+  mr.d <- mRMR.data(mrmr_train_fold)
+  mr_out <- mRMR.classic(mr.d, target_indices = c(length(mrmr_train_fold)), feature_count = fspls_n_best_features) #num of features from fspls
+  
+  mrmr_selected <- mrmr_train_fold[,solutions(mr_out)[[1]]]
+
+  if (is.null(dim(mrmr_selected))) {
+    subset_x_data_test <- cbind(testx[,solutions(mr_out)[[1]]], 1)
+    mrmr_selected <- cbind(mrmr_selected, 1) #add ones in case of just one feature being selected
+    colnames(mrmr_selected)[1] <- colnames(mrmr_train_fold)[solutions(mr_out)[[1]]]
+  } else {
+    subset_x_data_test <- testx[,colnames(mrmr_selected)]
+  }
+  
+  #regress
+   mrmr_ridge <- cv.glmnet(x = as.matrix(mrmr_selected), y = as.factor(trainy), family = family, alpha = 0, type.measure = measure, nfolds = 5) 
+  
+  #get test and train auc
+  #eval_mrmr <- assess.glmnet(mrmr_ridge, newx = testx[,colnames(mrmr_selected)], newy = testy)
+  mrmr_test_preds <- predict(mrmr_ridge, newx =  subset_x_data_test, s = 'lambda.1se')
+  mrmr_test_auc <- pROC::roc(as.numeric(testy), as.numeric(mrmr_test_preds))
+  
+  mrmr_train_preds <- predict(mrmr_ridge, newx = as.matrix(mrmr_selected), s="lambda.1se")
+  mrmr_train_auc <- pROC::roc(as.numeric(trainy), as.numeric(mrmr_train_preds))
+  
+  kfold_results$mrmr[i,] = c(length(solutions(mr_out)[[1]]),
+                         as.numeric(mrmr_train_auc$auc),
+                         as.numeric(mrmr_test_auc$auc),
+                         paste(colnames(mrmr_selected), collapse = ';'),
+                         length(testy))
+}
+
+#save results
+saveRDS(kfold_results, file = 'output/ng_kfold_results.Rds')
+
+```
+

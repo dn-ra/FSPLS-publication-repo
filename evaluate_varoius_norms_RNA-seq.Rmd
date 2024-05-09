@@ -1,0 +1,336 @@
+---
+title: "eval_class_preds_coin"
+author: "Daniel Rawlinson"
+date: "2023-10-04"
+output: html_document
+---
+
+#Libraries
+```{r setup}
+library(dplyr)
+library(magrittr)
+library(glmnet)
+library(tidyr)
+library(ggplot2)
+
+```
+
+#Load data
+```{r}
+RAPIDS_class_results <- readRDS('output/normalisation_class_test_all_approaches_RAPIDS.Rds')
+ng_class_results <- readRDS('output/normalisation_class_test_all_approaches_Ng.Rds')
+```
+
+#functions for extraction
+```{r}
+
+extract_true_and_fitted <- function(data_treatment_kfold_results) {
+  
+    
+  fitted_values <- lapply(data_treatment_kfold_results, function(x) lapply(x, '[', 'fitted'))
+  true_values <- lapply(data_treatment_kfold_results, function(x) lapply(x, '[', 'true'))
+  
+  fitted_list <- lapply(fitted_values, function(x) data.frame(x) %>% `colnames<-`(paste(names(x), 'fitted', sep = '.') ))
+  fitted_list <- mapply(function(x,y) {x$k_fold <- y
+                                      return(x) }, 
+                        fitted_list, 1:length(fitted_list), SIMPLIFY = F) #add kfold identifier
+  fitted_df <- do.call(rbind, fitted_list)
+  
+  true_list <- lapply(true_values, function(x) data.frame(x) %>% `colnames<-`(paste(names(x), 'true', sep = '.') ))
+  true_df <- do.call(rbind, true_list)
+  
+  return(cbind(fitted_df, true_df)) 
+
+}
+
+extract_num_features <- function(data_treatment_kfold_results) {
+  features_selected <- lapply(data_treatment_kfold_results, function(x) lapply(x, '[', 'nfeatures'))
+  features_list <- lapply(features_selected, function(x) data.frame(x) %>% `colnames<-`(paste(names(x), 'nfeatures', sep = '.') ))
+  features_list <- mapply(function(x,y) {x$k_fold <- y
+                                      return(x) }, 
+                        features_list, 1:length(features_list), SIMPLIFY = F) #add k_fold identifier
+  features_df <- do.call(rbind, features_list)
+}
+
+
+extract_fitted_probs <- function(data_treatment_kfold_results) {
+  probs_dfs <- lapply(data_treatment_kfold_results, function(x) lapply(x, function(y) y$fitted_probs))
+  true_values <- lapply(data_treatment_kfold_results, function(x) x$fspls$true)
+  probs_transposed <- purrr::transpose(probs_dfs)
+
+  probs_list <- lapply(probs_transposed, function(x) do.call(rbind, x))
+  
+  true_combined <- do.call(c, true_values)
+  return(list(fitted = probs_list, true = true_combined))
+}
+```
+
+#Process Ng results
+```{r}
+Ng_datas <- lapply(ng_class_results, extract_true_and_fitted)
+Ng_features <- lapply(ng_class_results, extract_num_features)
+Ng_datas <- mapply(function(x, y){ 
+  x$treatment <- gsub('kfold_results_','',y)
+  return(x)
+  }, Ng_datas, names(Ng_datas), SIMPLIFY = F)
+
+Ng_features <- mapply(function(x, y){ 
+  x$treatment <- gsub('kfold_results_','',y)
+  return(x)
+  }, Ng_features, names(Ng_features), SIMPLIFY = F)
+
+
+Ng_data_joined <- do.call(rbind, Ng_datas) %>% tibble::rownames_to_column() %>% pivot_longer(cols = !rowname & !treatment & !k_fold) %>% separate_wider_delim(cols = name, delim = '.', names = c('method', 'status')) %>% pivot_wider(id_cols = c(rowname, method, treatment, k_fold), names_from = status, values_from = value)
+
+
+
+Ng_features_datas <- do.call(rbind, Ng_features) %>% pivot_longer(cols = !k_fold & !treatment, names_to = 'method', values_to = 'nFeatures') %>% mutate(method = gsub('.nfeatures', '', method))
+
+Ng_features_datas$data = 'Ng'
+```
+
+#Ng accuracy plot
+```{r}
+Ng_auc_results <- Ng_data_joined %>% group_by(treatment, method, k_fold) %>% summarise(auc = Metrics::auc(true, fitted)) %>% pivot_longer(cols = c(auc),names_to = 'metric')
+
+Ng_auc_summarised <- Ng_auc_results %>% group_by(treatment, method) %>% 
+  summarise(means = mean(value),
+            se = sd(value) / sqrt(n()),
+            margin = 1.96 * se,
+            upper = means + margin,
+            lower = means - margin) %>%
+  mutate(treatment = factor(treatment, levels = c('normalised_X_class_y', 'faux_normalised_X_class_y','ratio_normalised_X_class_y')))
+
+ggplot(Ng_auc_summarised, aes(x = method, y = means, color = treatment)) + 
+  geom_point(position = position_dodge(width = 0.3), stroke = NA) + 
+  scale_y_continuous(trans = 'exp') + 
+  coord_cartesian(ylim = c(0.8,1)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), position = position_dodge(width = 0.3), width = 0.2) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 40, vjust = 1, hjust=1), legend.position = 'bottom')
+
+
+ggsave('plots/Ng_all_normalisations_aucs.pdf', height = 3, width = 2.5)
+```
+
+
+#Process RAPIDS results
+```{r}
+RAPIDS_datas <- lapply(RAPIDS_class_results, extract_true_and_fitted)
+RAPIDS_features <- lapply(RAPIDS_class_results, extract_num_features)
+
+RAPIDS_datas <- mapply(function(x, y){ 
+  x$treatment <- gsub('kfold_results_','',y)
+  return(x)
+  }, RAPIDS_datas, names(RAPIDS_datas), SIMPLIFY = F)
+
+RAPIDS_features <- mapply(function(x, y){ 
+  x$treatment <- gsub('kfold_results_','',y)
+  return(x)
+  }, RAPIDS_features, names(RAPIDS_features), SIMPLIFY = F)
+
+
+RAPIDS_data_joined <- do.call(rbind, RAPIDS_datas) %>% tibble::rownames_to_column() %>% pivot_longer(cols = !rowname & !treatment & !k_fold) %>% separate_wider_delim(cols = name, delim = '.', names = c('method', 'status')) %>% pivot_wider(id_cols = c(rowname, method, treatment, k_fold), names_from = status, values_from = value)
+
+
+
+RAPIDS_features_datas <- do.call(rbind, RAPIDS_features) %>% pivot_longer(cols = !k_fold & !treatment, names_to = 'method', values_to = 'nFeatures') %>% mutate(method = gsub('.nfeatures', '', method))
+
+RAPIDS_features_datas$data = 'RAPIDS'
+
+```
+
+#Join RAPIDS and Ng for feature plots
+```{r}
+both_datas_features <- full_join(RAPIDS_features_datas, Ng_features_datas) %>% 
+  mutate(treatment = case_when(grepl('faux', treatment) ~ 'faux_normalised', grepl('ratio', treatment) ~ 'ratio_normalised',  .default = 'ordinary_normalised')) %>%
+  mutate(method = case_when(method == 'enet' ~ 'elastic_net', .default = method)) %>%
+  mutate(treatment = factor(treatment, levels = c('ordinary_normalised', 'faux_normalised','ratio_normalised'))) %>%
+  group_by(data, treatment, method) %>% 
+  filter(method != 'mrmr') %>%
+  summarise(means = mean(nFeatures),
+            se = sd(nFeatures) / sqrt(n()),
+            margin = 1.96 * se,
+            upper = means + margin,
+            lower = means - margin)
+  
+ggplot(both_datas_features, aes(x = method, y = means, color = treatment)) + 
+  geom_point(position = position_dodge(width = 0.3), stroke = NA) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), position = position_dodge(width = 0.3), width = 0.3) +
+  #theme_minimal() +
+  theme(axis.text.x = element_text(angle = 40, vjust = 1, hjust=1), legend.position = 'bottom') + theme(legend.position = 'none') +
+  facet_wrap(vars(data))
+
+ggsave('plots/feature_numbers_three_normalisations.pdf',height = 3, width = 3)
+```
+
+
+#RAPIDS confusion matrices
+```{r}
+RAPIDS_cms <- RAPIDS_data_joined %>% group_by(method, treatment) %T>% {group_keys(.) ->> corresponding_methods}  %>% group_map(~ caret::confusionMatrix(.x$fitted %>% factor(levels = c(2,1,0)), .x$true %>% factor(levels = c(2,1,0))))
+
+names(RAPIDS_cms) <- mutate(corresponding_methods, name = paste(method, treatment))$name
+
+confusion_tables <- lapply(RAPIDS_cms, function(x){
+  plt <- as.data.frame(x$table)
+  plt$Prediction <- factor(plt$Prediction, levels=rev(levels(plt$Prediction)))
+  return(plt)
+})
+
+confusion_tables <- mapply(cbind, confusion_tables, "method"=corresponding_methods$method, treatment = corresponding_methods$treatment, SIMPLIFY=F)
+joined_confusion <- Reduce(rbind, confusion_tables) %>% group_by(method, treatment, Reference) %>% mutate(Proportion_of_Reference = Freq/sum(Freq))
+
+ggplot(joined_confusion, aes(rev(Reference),rev(Prediction), fill= Proportion_of_Reference)) +
+  geom_tile() + geom_text(aes(label=Freq), size = 5*0.36) +
+  scale_fill_gradient(low="white", high="#009194", limits = c(0,1), name = 'Prop') +
+  labs(x = "Reference",y = "Prediction") +
+  scale_x_discrete(labels=c("Bacterial","Viral","NonInfect")) +
+  scale_y_discrete(labels=rev(c("Bacterial","Viral","NonInfect"))) + 
+  facet_grid(cols = vars(treatment), rows = vars(method)) + 
+  theme_minimal() +theme(text=element_text(size=5) )
+ggsave(filename = 'plots/normalisation_tests_CMs_RAPIDS.pdf', width = 4, height = 3)
+```
+
+#RAPIDS accuracy metrics
+```{r}
+RAPIDS_accuracy_datas <- lapply(RAPIDS_class_results, extract_fitted_probs)
+
+#function for auc of each class
+build_binary_auc <- function(fitted_matr, true) {
+    true_factor <- factor(true, levels = c(2,0,1))
+    auc_list <- list()
+    for (class in levels(true_factor)) {
+      faux_binary_class <- true_factor
+      case_idx <- faux_binary_class == class
+      faux_binary_class[-case_idx] <- 0
+      faux_binary_class[case_idx] <- 1
+      
+      auc_obj <- pROC::roc(droplevels(faux_binary_class), as.numeric(fitted_matr[,class]) , auc = T)
+      auc_list[[class]] <- auc_obj$auc[1]
+    }
+    return(auc_list)
+}
+
+RAPIDS_aucs <- lapply(RAPIDS_accuracy_datas, function(x) lapply(x$fitted, function(y) build_binary_auc(y, x$true)))
+
+#Sensitivity and Specificity from cms
+sens_spec <- lapply(RAPIDS_cms, function(x) x$byClass[,c(1,2)])
+sens_spec_list <- Map(function(x, y) {
+    x = as.data.frame(x)
+    name_split <- stringr::str_split_1(y, " ")
+    x$method = name_split[1]
+    x$treatment = name_split[2]
+    x$class = gsub('Class: ','',rownames(x))
+    return(x)
+}, sens_spec, names(sens_spec))
+sens_spec_df <- do.call(rbind, sens_spec_list)
+
+#combine with aucs
+auc_vector <- unlist(RAPIDS_aucs)
+name_split <- stringr::str_split_fixed(names(auc_vector), '\\.', n = 3)
+
+auc_data_df <- cbind.data.frame(auc_vector, name_split)%>% `colnames<-`(c('AUC','treatment', 'method', 'class'))
+
+RAPIDS_accuracy_joined <- dplyr::full_join(sens_spec_df, auc_data_df)
+```
+
+#Plot RAPIDS accuracies
+```{r}
+RAPIDS_accuracy_melt <- tidyr::pivot_longer(RAPIDS_accuracy_joined, cols = c('Sensitivity', 'Specificity', 'AUC'), names_to = 'metric', values_to = 'value') %>% mutate(class = factor(class, levels = c(2,1,0)))
+ggplot(RAPIDS_accuracy_melt, aes(x = metric, y = class, fill = value)) + 
+  geom_tile() + 
+  geom_text(aes(label=round(value, digits = 2)), size = 5*0.36) +
+  facet_grid(cols = vars(treatment), rows = vars(method)) + scale_fill_continuous(limits = c(0,1)) + 
+  theme_minimal() + 
+  theme(text = element_text(size = 5)) + scale_y_discrete(labels=rev(c("Bacterial","Viral","NonInfect")))
+ggsave(filename = 'plots/normalisation_tests_accuracy_RAPIDS.pdf', width = 4, height = 3)
+```
+
+#Plot expression levels of normalisation and discrimination features
+
+##Ng
+```{r}
+ng_data <- readRDS('input/ng_data/ng_data.prepd.Rds')
+ng_norm_results <- readRDS('output/normalisationFS_Ng.Rds')
+ng_norm_features <- lapply(ng_norm_results, function(x) x$selected_features) %>% unlist() %>% stringr::str_split(pattern = ";") %>% unlist() %>% unique()
+
+ng_discrim_features <- lapply(ng_class_results$kfold_results_faux_normalised_X_class_y, function(x) x$fspls$selected_features) %>% unlist() %>% stringr::str_split(pattern = ";") %>% unlist() %>% unique()
+
+norm_features_for_plot <- data.frame(gene_name = ng_norm_features, feature_type = 'normalisation')
+discrim_features_for_plot <- data.frame(gene_name = ng_discrim_features, feature_type = 'discrimination')
+selected_features_for_plot <- rbind(norm_features_for_plot, discrim_features_for_plot)
+
+
+#identify highly expressed genes (all candidates)
+vars_X <- ng_data$data %>% log1p() %>% {apply(., 2, mean)} %>% sort(decreasing = T)
+ng_normalisation_candidates <- names(vars_X)[1:10000]
+
+
+
+#Ng_all_candidate_feautres <- union(ng_normalisation_candidates, ng_discrimination_candidates)
+Ng_all_candidate_feautres <- ng_normalisation_candidates
+
+
+#library normalisation
+ng_library_factor <- apply(ng_data$data, 1, sum) / 1e6
+ng_tpms <- sweep(ng_data$data, 1, STATS = ng_library_factor, FUN = '/')
+ng_tpms <- log1p(ng_tpms)
+
+
+#all candidate features
+ng_tpms <- ng_tpms[,Ng_all_candidate_feautres]
+
+#mean expression per feature
+mean_exps <- apply(ng_tpms, 2, mean) %>% as.data.frame() %>% tibble::rownames_to_column() %>% `colnames<-`(c('gene_name', 'mean_exps'))
+
+
+#mean exps of chosen features
+selected_features_exp_for_plot <- selected_features_for_plot %>% left_join(mean_exps, multiple = 'any')
+
+ggplot() + geom_density(data = mean_exps, aes(x = mean_exps), fill ='gray', alpha = 0.5) + geom_vline(data = selected_features_exp_for_plot, aes(xintercept = mean_exps, color = feature_type), linewidth = 0.2) + theme_bw()
+ggsave('plots/Ng_chosen_feature_expression_density_plot.pdf', height = 2, width = 4)
+```
+
+##RAPIDS
+```{r}
+#get mean expression for all genes that were considered
+RAPIDS_data <- readRDS('input/coin_data/coin_multiclass_data.prepd.Rds')
+RAPIDS_class_results <- readRDS('output/normalisation_class_test_all_approaches_RAPIDS.Rds')
+
+RAPIDS_norm_results <- readRDS('output/normalisationFS_RAPIDS.Rds')
+RAPIDS_norm_features <- lapply(RAPIDS_norm_results, function(x) x$selected_features) %>% unlist() %>% stringr::str_split(pattern = ";") %>% unlist() %>% unique()
+
+RAPIDS_discrim_features <- lapply(RAPIDS_class_results$coin_faux_norm_kfold_results, function(x) x$fspls$selected_features) %>% unlist() %>% stringr::str_split(pattern = ";") %>% unlist() %>% unique()
+
+norm_features_for_plot <- data.frame(gene_name = RAPIDS_norm_features, feature_type = 'normalisation')
+discrim_features_for_plot <- data.frame(gene_name = RAPIDS_discrim_features, feature_type = 'discrimination')
+selected_features_for_plot <- rbind(norm_features_for_plot, discrim_features_for_plot)
+
+
+#most stably expressed genes (normalisation candidates)
+feature_means_discovery <- apply(RAPIDS_data$X_data, 2, mean, trim = 0.05) %>% sort(decreasing = T)
+RAPIDS_normalisation_candidates <- names(feature_means_discovery)[1:10000]
+
+#most variable genes (discrimination candidates)
+vars_X <- RAPIDS_data$X_data %>% log1p() %>% {apply(., 2, var)} %>% sort(decreasing = T)
+RAPIDS_discrimination_candidates <- names(vars_X)[1:10000]
+
+RAPIDS_all_candidate_feautres <- union(RAPIDS_normalisation_candidates, RAPIDS_discrimination_candidates)
+
+#library normalisation
+RAPIDS_library_factor <- apply(RAPIDS_data$X_data, 1, sum) / 1e6
+RAPIDS_x <- RAPIDS_data$X_data[,RAPIDS_all_candidate_feautres]
+RAPIDS_tpms <- sweep(RAPIDS_x, 1, STATS = RAPIDS_library_factor, FUN = '/')
+RAPIDS_tpms <- log1p(RAPIDS_tpms)
+
+
+#mean expression per feature
+mean_exps <- apply(RAPIDS_tpms, 2, mean) %>% as.data.frame() %>% tibble::rownames_to_column() %>% `colnames<-`(c('gene_name', 'mean_exps')) %>% mutate(discrimination = case_when(gene_name %in% RAPIDS_discrimination_candidates ~ T, .default = F), normalisation = case_when(gene_name %in% RAPIDS_normalisation_candidates ~T, .default = F)) %>% tidyr::pivot_longer(cols = c(discrimination, normalisation), names_to = 'candidates') %>% filter(value !=F)
+
+#mean exps of chosen features
+selected_features_exp_for_plot <- selected_features_for_plot %>% left_join(mean_exps, multiple = 'any')
+
+ggplot() + geom_density(data = mean_exps, aes(x = mean_exps, fill = candidates), alpha = 0.5) + geom_vline(data = selected_features_exp_for_plot, aes(xintercept = mean_exps, color = feature_type), linewidth = 0.2) + theme_bw()
+ggsave('plots/RAPIDS_chosen_feature_expression_density_plot.pdf', height = 2, width = 4)
+```
+

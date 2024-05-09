@@ -1,0 +1,716 @@
+---
+title: "library_normalisation_FS"
+author: "Daniel Rawlinson"
+date: "05/07/2023"
+output: html_document
+---
+
+#Libraries
+```{r}
+library(ggplot2)
+library(glmnet)
+library(dplyr)
+library(magrittr)
+library(mRMRe)
+library(abind)
+library(caret)
+library(parallel)
+library(ROCR)
+```
+
+#load FS-PLS
+```{r}
+source('/home/danrawlinson/git/fspls/fspls_lachlan/fspls.R')
+pv_thresh = 0.01
+refit=FALSE
+```
+
+#Ng
+##Data
+```{r}
+ng_counts_data <- readRDS('../input/ng_data/ng_counts.prepd.Rds')
+
+#get library sizes
+lib.sizes <- rowSums(ng_counts_data)
+#make it more normal distributed
+lib.sizes.log <- log(lib.sizes)
+
+family = 'gaussian'
+options('family' = family)
+
+#failed to reproduce fold structure programmatically hard-coding below.
+folds <- list(c(5, 16, 18, 27, 29, 33, 34, 35, 38, 41, 47, 54, 67, 70, 75, 78, 84, 88, 93, 94, 97, 107, 110, 124, 133, 135, 141, 144, 146, 152, 155, 159, 161, 162, 167, 169, 173, 175, 188, 191, 197, 202, 217, 224, 225, 237, 239, 241, 243, 245, 249, 258),  
+c(11, 17, 21, 25, 49, 50, 51, 60, 62, 64, 65, 66, 85, 96, 100, 102, 105, 111, 113, 121, 136, 147, 148, 153, 154, 163, 164, 176, 177, 180, 182, 183, 192, 194, 196, 198, 210, 215, 220, 221, 228, 229, 230, 233, 238, 242, 244, 248, 251, 252, 257),
+c(2, 9, 13, 15, 22, 39, 40, 42, 46, 52, 53, 56, 57, 59, 61, 68, 69, 71, 74, 77, 80, 81, 83, 86, 89, 101, 103, 108, 122, 123, 130, 137, 139, 142, 158, 166, 171, 172, 174, 178, 184, 187, 193, 212, 213, 214, 216, 219, 223, 227, 236),
+c(4, 6, 7, 10, 19, 24, 28, 30, 32, 44, 45, 48, 72, 79, 82, 98, 104, 106, 109, 112, 114, 115, 116, 118, 120, 125, 126, 129, 131, 132, 143, 145, 149, 150, 151, 160, 165, 168, 170, 181, 201, 204, 205, 206, 208, 222, 226, 231, 240, 247, 254, 256),
+c(1, 3, 8, 12, 14, 20, 23, 26, 31, 36, 37, 43, 55, 58, 63, 73, 76, 87, 90, 91, 92, 95, 99, 117, 119, 127, 128, 134, 138, 140, 156, 157, 179, 185, 186, 189, 190, 195, 199, 200, 203, 207, 209, 211, 218, 232, 234, 235, 246, 250, 253, 255) )
+
+ feature_means_ng <- apply(ng_counts_data, 2, mean, trim = 0.05) %>% sort(decreasing = T)
+ ng_counts_data <- ng_counts_data[,names(feature_means_ng)[1:10000]]
+
+
+# feature_rarity <- apply(ng_counts_data, 2, function(x) {
+#   samps_with_expression <- sum(x>0)
+#     pct_samps_expressed <- samps_with_expression/length(x)
+#     return(pct_samps_expressed)
+# } )
+# remove_features <- which(feature_rarity < 0.2)
+#ng_counts_data <- ng_counts_data[,-remove_features]
+
+```
+
+##run
+```{r}
+#init results list
+norm_results <- list()
+
+fold_structure <- list('nfeatures' = numeric(), 'selected_features' = vector(), 'train_acc' = numeric(), 'test_acc' = numeric(), 
+                       'nsamples_test' = numeric(), 'true' = vector(), 'fitted' = vector(), 'test_idx' = vector())
+
+
+for (i in 1:length(folds)) {
+  train_idx <- folds[-i] %>% unlist()
+  test_idx <- folds[[i]]
+  
+
+  trainx_unnormalised <- ng_counts_data[train_idx,]
+  trainx <- trainx_unnormalised %>% log1p()
+
+  trainy <- lib.sizes.log[train_idx] 
+  
+  testx_unnormalised <- ng_counts_data[test_idx,]
+  testx <- testx_unnormalised %>% log1p()
+
+  testy <- lib.sizes.log[test_idx]
+
+  
+  #FS-PLS
+  fspls_train_data <- list(data = as.matrix(trainx), y = as.matrix(trainy))
+  fspls_test_data <- list(data = as.matrix(testx), y = as.matrix(testy))
+  
+  model_fspls <- trainModel(trainOriginal = fspls_train_data, 
+                            pv_thresh = pv_thresh, testOriginal = fspls_test_data, refit =refit, max = 2, center_scale = F)
+
+  #re-evaluate
+  n_variables <- length(model_fspls$variables)
+  
+  #get pred values
+  test_data_ppd <- preprocess(fspls_test_data, centralise = F)
+  test_response <- pred(model_fspls$beta[1:n_variables,], 
+                        model_fspls$variables[1:n_variables], 
+                        const = model_fspls$constantTerm, 
+                        Wall = model_fspls$Wall[1:n_variables, 1:n_variables], 
+                        data= test_data_ppd, 
+                        means = model_fspls$means[1:n_variables])#, Wall = model_fspls$Wall[1:n_variables, 1:n_variables])
+
+  
+  #get RMSE
+  test_acc <- Metrics::rmse(as.numeric(testy), as.numeric(test_response))
+
+  #set other variables
+  train_acc <- model_fspls$eval[n_variables+1,2]
+  selected_features <- names(model_fspls$means)[1:n_variables] %>% paste(collapse = ';')
+
+  
+  norm_results[[i]] = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                              list(n_variables,
+                                   selected_features,
+                                   train_acc,
+                                   test_acc,
+                                   length(testy),
+                                   testy,
+                                   as.numeric(test_response),
+                                   test_idx),  
+                              SIMPLIFY = F)
+  
+  
+}
+saveRDS(norm_results, 'output/normalisationFS_Ng.Rds')
+
+```
+
+##Prep Faux and Ratio normalisation dataframes from discriminatino feature selection
+```{r}
+ng_diagnoses <- readRDS('input/ng_data/ng_data.prepd.Rds')$y #[,2] #0 is acute respiratory, 1 is covid
+all(rownames(ng_counts_data) == names(ng_diagnoses))
+
+#predictd lib sizes
+pred_lib_sizes <- lapply(norm_results, 
+                                     function(x) data.frame(x[c('test_idx','fitted')]) )
+pred_lib_sizes.df <- do.call(rbind, pred_lib_sizes) %>% arrange(test_idx)
+norm_features <- lapply(norm_results, 
+          function(x) data.frame(x['selected_features']) %>% stringr::str_split(pattern = ';') %>% unlist()) 
+
+#get top 10000 most expressed genes
+feature_means_ng <- apply(ng_counts_data, 2, mean, trim = 0.05) %>% sort(decreasing = T)
+ng_counts_df <- ng_counts_data[,names(feature_means_ng)[1:10000]]
+
+#Perform data treatments
+ng_data_X = list(normalised_X = 
+                   sweep(ng_counts_df, MARGIN = 1, STATS = lib.sizes / 1e6, FUN = '/'),
+                 faux_normalised_X = 
+                   sweep(ng_counts_df, MARGIN = 1, STATS = pred_lib_sizes.df$fitted %>% expm1() %>% {./1e6}, FUN = '/')
+)
+
+ng_data_class = list(ordinary_y = ng_diagnoses)
+
+#ratio normalised data - this is a list of length =k, and needs to be passed iteratively with k using mcmapply
+ratio_normalised_X = lapply(norm_features, FUN = function(normalise) { 
+  all_normalisations <- sapply(as.list(normalise), 
+         function(normalising_feature) {
+           normed_counts <- apply(log1p(ng_counts_df), MARGIN = 2, 
+                 function(column) column - log1p(ng_counts_data[,normalising_feature]))
+          colnames(normed_counts) <- paste0(colnames(normed_counts), '.normed_by.',normalising_feature)
+          return(normed_counts)
+         }, simplify = F)
+  all_normalisations <- do.call(cbind, all_normalisations)
+  return(all_normalisations)
+  })
+
+
+```
+
+##Run disccrimination feature selection
+```{r}
+ng_folds <- lapply(norm_results, function(x) x$test_idx) #now fold structure matches that from normalisation training
+
+family = 'binomial'
+options('family' = 'binomial')
+measure = 'auc'
+
+#init report structure
+
+fold_structure <- list('nfeatures' = numeric(), 'selected_features' = vector(), 'train_auc' = numeric(), 'test_auc' = numeric(), 
+                       'nsamples_test' = numeric(), 'true' = vector(), 'fitted' = vector(), 'test_idx' = vector(), model = NULL)
+
+
+#function for running loop
+all_methods_for_fold <- function(i, X_data, y_data, #pre_trained_models = NULL, 
+                                 log = T, scale = T, use_1se = T) {
+  
+  fold_results <-list()
+  
+  #models = pre_trained_models[[i]]
+  
+  train_idx <- ng_folds[-i] %>% unlist()
+  test_idx <- ng_folds[[i]]
+  
+  trainx <-  X_data[train_idx,] %>%
+    { if(log) log1p(.) else .} %>% 
+    {if (scale) scale(.) else .} 
+  
+  testx <- X_data[test_idx,] %>%
+    { if(log) log1p(.) else .} %>% 
+    {if (scale) scale(.) else .} 
+  
+  trainy <-y_data[train_idx]
+  testy <- y_data[test_idx]
+  
+  
+  #lasso
+
+  lasso_cv <- cv.glmnet(trainx, trainy, type.measure = measure, family = family, nfolds = 5)
+
+  
+  lasso_test_preds <- predict(lasso_cv, newx = testx, s = 'lambda.1se', type = 'response') #report probabilities for AUC calculation
+  lasso_test_assess <- assess.glmnet(lasso_cv, newx = testx, newy = testy, family = family)
+  
+  
+  fold_results$lasso = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                              list(lasso_cv$nzero[lasso_cv$index['1se',]],
+                                   names(which(lasso_cv$glmnet.fit$beta[,lasso_cv$index['1se',]] != 0)) %>% paste(collapse = ';'),
+                                   lasso_cv$cvm[lasso_cv$index['1se',]],
+                                   lasso_test_assess$auc[1], 
+                                   length(testy),
+                                   testy,
+                                   as.numeric(lasso_test_preds),
+                                   test_idx,
+                                   lasso_cv),  
+                              SIMPLIFY = F)
+  
+  
+  #elastic net
+  
+  elasticnet_cv <- cv.glmnet(trainx, trainy, type.measure = measure, family = family, nfolds = 5, alpha = 0.5)
+
+  
+  enet_test_preds <- predict(elasticnet_cv, newx  = testx, s = 'lambda.1se', type = 'response')
+  enet_test_assess <- assess.glmnet(elasticnet_cv, newx = testx, newy = testy, family = family)
+  
+  fold_results$elastic_net = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                                    list(elasticnet_cv$nzero[elasticnet_cv$index['1se',]],
+                                         names(which(elasticnet_cv$glmnet.fit$beta[,elasticnet_cv$index['1se',]] != 0)) %>% paste(collapse = ';'),
+                                         elasticnet_cv$cvm[elasticnet_cv$index['1se',]],
+                                         enet_test_assess$auc[1], 
+                                         length(testy),
+                                         testy,
+                                         as.numeric(enet_test_preds),
+                                         test_idx,
+                                         elasticnet_cv),  
+                                    SIMPLIFY = F)
+  
+  #fs_pls
+  
+  
+  fspls_data_train <- list(data = as.matrix(trainx), y = as.matrix(trainy))
+  fspls_data_test <- list(data = as.matrix(testx), y = as.matrix(testy))
+  
+  model_fspls <- trainModel(trainOriginal = fspls_data_train, max = 10, pv_thresh = pv_thresh, testOriginal = fspls_data_test, refit = refit)
+  
+  
+  #which variable number to choose?
+  evals <- model_fspls$eval[2:nrow(model_fspls$eval),3] #select according to auc
+  eval_max <- max(evals)
+  n_variables = which(evals == eval_max)[1]
+  
+  #fspls preds
+  test_response <- pred(model_fspls$beta[1:n_variables,], model_fspls$variables[1:n_variables], 
+                        const = model_fspls$constantTerm, Wall = model_fspls$Wall[1:n_variables, 1:n_variables], 
+                        data= fspls_data_test, 
+                        means = model_fspls$means[1:n_variables])
+  test_measure <- pROC::roc(testy, test_response, auc = T)
+  
+  fold_results$fspls = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                              list(n_variables,
+                                   names(model_fspls$means)[1:n_variables] %>% paste(collapse = ';'),
+                                   evals[n_variables],
+                                   test_measure$auc[1],
+                                   length(testy),
+                                   testy,
+                                   as.numeric(test_response),
+                                   test_idx,
+                                   model_fspls),  
+                              SIMPLIFY = F)
+  
+  
+  #mRMR
+  #force mRMR to use the same number of features as fspls
+  
+  mrmr_train_fold <- cbind(trainx, target  = as.numeric(trainy)) %>% as.data.frame()
+  mr.d <- mRMR.data(mrmr_train_fold)
+  mr_out <- mRMR.classic(mr.d, target_indices = c(length(mrmr_train_fold)), feature_count = n_variables) #num of features from fspls
+  
+  mrmr_selected <- mrmr_train_fold[,solutions(mr_out)[[1]]]
+  
+  if (is.null(dim(mrmr_selected))) {
+    subset_x_data_test <- cbind(testx[,solutions(mr_out)[[1]]], 1)
+    mrmr_selected <- cbind(mrmr_selected, 1) #add ones in case of just one feature being selected
+    colnames(mrmr_selected)[1] <- colnames(mrmr_train_fold)[solutions(mr_out)[[1]]]
+  } else {
+    subset_x_data_test <- testx[,colnames(mrmr_selected)]
+  }
+  
+  #do ordinary glm on mrmr
+
+  mrmr_glm <- glmnet(as.matrix(mrmr_selected), y = as.numeric(trainy), family = family, alpha = 0, type.measure = measure, lambda = 0)
+  mrmr_test_preds <- predict(mrmr_glm, newx  = testx[,colnames(subset_x_data_test)],  type = 'response')
+  mrmr_test_assess <- assess.glmnet(mrmr_glm, newx = testx[,colnames(subset_x_data_test)], newy = testy, family = family)
+    
+  
+  fold_results$mrmr = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                             list(mrmr_glm$df,
+                                  rownames(mrmr_glm$beta) %>% paste(collapse = ';'),
+                                  NULL,
+                                  mrmr_test_assess$auc[1],
+                                  length(testy),
+                                  testy,
+                                  as.numeric(mrmr_test_preds),
+                                  test_idx,
+                                  mrmr_glm),  
+                             SIMPLIFY = F)
+  
+  return(fold_results)
+}
+
+#function for prepping results for save
+name_list <- function(...){
+  vnames <- as.character(match.call())[-1]
+  return(setNames(list(...), vnames))
+}
+
+
+#treatment 1 - Proper normalisation X
+kfold_results_normalised_X_class_y <- mclapply(X = as.list(1:5), all_methods_for_fold, ng_data_X$normalised_X, ng_data_class$ordinary_y, log = T, scale = F)
+#save
+all_results <- name_list(kfold_results_normalised_X_class_y)
+saveRDS(object = all_results, file = 'output/normalisation_class_test_all_approaches_Ng.Rds')
+
+
+#treatment 2 - faux normalisation X
+kfold_results_faux_normalised_X_class_y <- mclapply(X = as.list(1:5), all_methods_for_fold, ng_data_X$faux_normalised_X, ng_data_class$ordinary_y, log = T, scale = F)
+#save
+all_results <- name_list(kfold_results_normalised_X_class_y, kfold_results_faux_normalised_X_class_y)
+saveRDS(object = all_results, file = 'output/normalisation_class_test_all_approaches_Ng.Rds')
+
+kfold_results_ratio_normalised_X_class_y <- mcmapply(FUN = function(i, x, y) {
+  all_methods_for_fold(i,x,y, log = F, scale = F) #log is false here because ratios are already logged
+  }, as.list(1:5), ratio_normalised_X, rep(list(ng_data_class$ordinary_y),5 ), SIMPLIFY = F)
+
+all_results <- name_list(kfold_results_normalised_X_class_y, 
+                         kfold_results_faux_normalised_X_class_y, 
+                         kfold_results_ratio_normalised_X_class_y)
+saveRDS(object = all_results, file = 'output/normalisation_class_test_all_approaches_Ng.Rds')
+```
+
+
+#RAPIDS
+##Data
+```{r}
+sepsis_data <- readRDS('input/coin_data/coin_multiclass_data.prepd.Rds')
+sepsis_validation <- readRDS('input/coin_data/coin_validaiton_data.prepd.Rds')
+
+discovery_libs <- sepsis_data$X_data %>% rowSums()
+
+feature_means_discovery <- apply(sepsis_data$X_data, 2, mean, trim = 0.05) %>% sort(decreasing = T) 
+feature_means_validation <- apply(sepsis_validation$X_data, 2, mean, trim = 0.05) %>% sort(decreasing = T) 
+
+#trim discovery features
+sepsis_discovery_df.trimmed <- sepsis_data$X_data[,names(feature_means_discovery[1:10000])]
+remove_due_to_validation <- match(colnames(sepsis_discovery_df.trimmed), names(feature_means_validation)) %>% {which(. > 15000 | is.na(.))}
+
+sepsis_discovery_df.trimmed <- sepsis_discovery_df.trimmed[,-remove_due_to_validation]
+
+set.seed(42)
+discovery_libs.kfold <- caret::createFolds(y = discovery_libs, k=5 )
+
+```
+
+
+##run
+```{r}
+options('family' = 'gaussian')
+family = 'gaussian'
+
+fold_structure <- list('nfeatures' = numeric(), 'selected_features' = vector(), 'train_acc' = numeric(), 'test_acc' = numeric(), 'nsamples_test' = numeric(), 'true' = vector(), 'fitted' = vector(), 'test_idx' = vector(), 'model' = NULL)
+
+run_fspls_on_fold_for_library <- function(i, X_data, y_data, folds) {
+  train_idx <- folds[-i] %>% unlist()
+  test_idx <- folds[[i]]
+  
+  trainx <- log1p(X_data[train_idx,])
+  testx <- log1p(X_data[test_idx,])
+  
+  trainy <- log1p(y_data[train_idx])
+  testy <- log1p(y_data[test_idx])
+  
+  fspls_train_data <- list(data = as.matrix(trainx), y = as.matrix(trainy))
+  fspls_test_data <- list(data = as.matrix(testx), y = as.matrix(testy))
+  #family is inferred from getOption. Think it's wiser to set family as an argument.
+  fspls_model <- trainModel(trainOriginal = fspls_train_data, pv_thresh = pv_thresh, testOriginal = fspls_test_data, refit =refit, max = 2)
+
+    #which variable number to choose? Borrowing from glmnet's 1se idea
+  evals <- fspls_model$eval[2:(length(fspls_model$variables)+1),2]
+  eval_min <- min(evals) #now min because I want to minimise mse
+  eval_se <- sd(evals)
+  if (length(fspls_model$variables) > 3) {
+    tolerable_acc = eval_min
+  } else {
+      tolerable_acc <- eval_min + eval_se
+  }
+  n_variables = which(evals <= tolerable_acc)[1]
+  
+  #fspls preds
+  test = preprocess(fspls_test_data, centralise = FALSE)
+  test_response <- pred(fspls_model$beta[1:n_variables,], fspls_model$variables[1:n_variables], const = fspls_model$constantTerm, Wall = fspls_model$Wall[1:n_variables, 1:n_variables], data= test, means = fspls_model$means[1:n_variables])#, Wall = fspls_model$Wall[1:n_variables, 1:n_variables])
+
+  
+  fspls_n_best_features <- length(fspls_model$variables)
+  fspls_best_feature_list <- colnames(testx)[fspls_model$variables]
+
+ fold_results = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                              list(fspls_n_best_features,
+                                   fspls_best_feature_list %>% paste(collapse = ';'),
+                                   evals[n_variables],
+                                   fspls_model$eval[n_variables+1,7],
+                                   length(testy),
+                                   testy,
+                                   as.numeric(test_response),
+                                   test_idx,
+                                   fspls_model),  
+                              SIMPLIFY = F)
+  
+  return(fold_results)
+}
+
+discovery_lib_kfold_results <- mclapply(X = as.list(1:5), run_fspls_on_fold_for_library, sepsis_discovery_df.trimmed, discovery_libs, discovery_libs.kfold)
+
+saveRDS(discovery_lib_kfold_results, 'output/normalisationFS_RAPIDS')
+
+```
+
+##Prep Faux and Ratio normalisation dataframes for discrimination feature selection
+```{r}
+
+#predictd lib sizes
+pred_lib_sizes.discovery <- lapply(discovery_lib_kfold_results, 
+                                     function(x) data.frame(x[c('test_idx','fitted')]) )
+pred_lib_sizes.df.discovery <- do.call(rbind, pred_lib_sizes.discovery) %>% arrange(test_idx)
+
+#normalising features
+norm_features.discovery <- lapply(discovery_lib_kfold_results, 
+          function(x) data.frame(x['selected_features']) %>% stringr::str_split(pattern = ';') %>% unlist()) 
+
+
+#trim features from discovery candidates. Ensure they are in common with validation set
+feature_vars_discovery <- apply(log1p(sepsis_data$X_data), 2, var) %>% sort(decreasing = T)
+feature_vars_validation <- apply(log1p(sepsis_validation$X_data),2,var) %>% sort(decreasing = T)
+
+#highly variable genes common to both cohorts
+common_in_both_cohorts <- intersect(names(feature_vars_discovery[1:10000]), names(feature_vars_validation[1:10000]))
+#add normalising features into it
+common_in_both_cohorts <- c(common_in_both_cohorts, unlist(norm_features.discovery) %>% unique())
+
+#subset the sepsis discovery data
+sepsis_discovery_df.features_trimmed <- sepsis_data$X_data[,common_in_both_cohorts]
+
+#ordinary normalisation
+true_lib_sizes.discovery <- lapply(discovery_lib_kfold_results, 
+                                     function(x) data.frame(x[c('test_idx','true')]) )
+true_lib_sizes.df.discovery <- do.call(rbind, true_lib_sizes.discovery) %>% arrange(test_idx) %>% mutate(true = expm1(true))
+sepsis_discovery_data_ordinary_normalised <- sweep(x = sepsis_discovery_df.features_trimmed, MARGIN = 1, STATS = true_lib_sizes.df.discovery$true %>% {./1e6}, FUN = '/')
+
+#normalise by predicted library size
+sepsis_discovery_data_faux_normalised <- sweep(x = sepsis_discovery_df.features_trimmed, MARGIN = 1, STATS = pred_lib_sizes.df.discovery$fitted %>% expm1() %>% {./1e6}, FUN = '/')
+
+
+#build feature ratio matrix
+
+#list of n = k, each element with a data.frame using the normalisation features for ratio construction
+sepsis_discovery_data_ratio_normalised = lapply(norm_features.discovery, FUN = function(normalise) { 
+  all_normalisations <- sapply(as.list(normalise), 
+         function(normalising_feature) {
+           normed_counts <- apply(log1p(sepsis_discovery_df.features_trimmed), MARGIN = 2, 
+                 function(column) column - log1p(sepsis_discovery_df.features_trimmed[,normalising_feature]))
+          colnames(normed_counts) <- paste0(colnames(normed_counts), '.normed_by.',normalising_feature)
+          return(normed_counts)
+         }, simplify = F)
+  all_normalisations <- do.call(cbind, all_normalisations)
+  return(all_normalisations)
+  })
+
+```
+
+##Run disccrimination feature selection
+```{r}
+sepsis.folds <- lapply(discovery_lib_kfold_results, function(x) x$test_idx) #keep same structure of norm feature discovery
+options('family' = 'multinomial')
+measure = 'deviance'
+family = 'multinomial'
+met = 'dev' #for fspls training measure
+
+fold_structure <- list('nfeatures' = numeric(), 'selected_features' = vector(), 'train_acc' = numeric(), 
+                       'test_acc' = numeric(), 
+                       'nsamples_test' = numeric(), 'true' = vector(), 'fitted' = vector(), 'fitted_probs' = data.frame(), 
+                       'test_idx' = vector(), 'weights' = vector(), 'model' = NULL)
+
+run_methods_on_fold_for_class <- function(i, X_data, y_data, folds, log = TRUE, scale = FALSE) {
+  
+  fold_results <- list()
+  
+  pivot = 2 #not directly used in modelling. Just put here in case I've missed the change in hardcoding anywhere.
+  
+  train_idx <- folds[-i] %>% unlist()
+  test_idx <- folds[[i]]
+  
+  trainx <-  X_data[train_idx,] %>%
+    { if(log) log1p(.) else .} %>% 
+    {if (scale) scale(.) else .} 
+  
+  testx <- X_data[test_idx,] %>%
+    { if(log) log1p(.) else .} %>% 
+    {if (scale) scale(.) else .} 
+  
+  trainy <- y_data[train_idx] %>% as.numeric()-1
+  testy <- y_data[test_idx] %>% as.numeric()-1
+  
+  #weights - only for LASSO, Enet, mRMR
+  training_class_weights <- (1/prop.table(table(trainy))) %>% {./sum(.)}
+  case_weights <- training_class_weights[as.character(trainy)]
+
+  
+  #FSPLS
+  
+  fspls_train_data <- list(data = as.matrix(trainx), y = as.matrix(trainy))
+  fspls_test_data <- list(data = as.matrix(testx), y = as.matrix(testy))
+  #family is inferred from getOption. Think it's wiser to set family as an argument.
+  model_fspls <- trainModel(trainOriginal = fspls_train_data, pv_thresh = pv_thresh, testOriginal = fspls_test_data, refit =refit, max = 10, pivot = 2, weights = NULL) #make sure weights are null just for FSPLS
+
+  metric_col <- which(c('rms','auc','acc', 'dev') == met)
+  train_col_metric <- metric_col + 1
+  test_col_metric <- train_col_metric + 5
+  
+  
+  evals <- model_fspls$eval[2:(length(model_fspls$variables)+1),train_col_metric] #index four corresponds to trainig accuracy
+  
+  eval_min <- min(evals)
+
+  n_variables_min= which(evals == eval_min)[1]
+  
+  #fspls preds
+  #preprocess test data to add 'levs' attribute and set pivot level
+  test = preprocess(fspls_test_data, centralise = FALSE, pivot=2) #make sure pivot matches that used in `trainModel`
+
+  #eval at min features
+  test_response_min <- pred(model_fspls$beta[1:n_variables_min,], 
+                          model_fspls$variables[1:n_variables_min], 
+                          const = model_fspls$constantTerm, 
+                          Wall = model_fspls$Wall[1:n_variables_min, 1:n_variables_min], 
+                          data= test, 
+                          means = model_fspls$means[1:n_variables_min])
+  test_preds_min <- liability(test_response_min)
+  
+  test_response_min_return <- cbind(1, exp(test_response_min)) %>% `colnames<-`(attr(test_response_min, 'levs')) %>% {apply(., 1, .prob)} %>% t()
+
+
+  fspls_best_feature_list_min <- colnames(testx)[model_fspls$variables[1:n_variables_min]]
+
+  fold_results$fspls = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                              list(n_variables_min, #number of variables
+                                   fspls_best_feature_list_min %>% paste(collapse = ';'), #variable names
+                                   evals[n_variables_min], #train metric
+                                   model_fspls$eval[n_variables_min+1,test_col_metric], #test metric
+                                   length(testy), #number of samples
+                                   testy, #true test values
+                                   as.numeric(test_preds_min), #fitted values (class)
+                                   test_response_min_return, #fitted probabilities
+                                   test_idx, #sample ids used for test
+                                   NULL, #weights were NULL for fspls
+                                   model_fspls),  #store the model
+                              SIMPLIFY = F)
+  
+  #LASSO
+  
+  
+  lasso_cv <- cv.glmnet(trainx, trainy, type.measure = measure, family = family, nfolds = 5, weight = case_weights)
+  lasso_test_preds <- predict(lasso_cv, newx = testx, s = 'lambda.1se', type = 'response') #report probabilities for AUC calculation
+  lasso_test_assess <- assess.glmnet(lasso_cv, newx = testx, newy = testy, family = family)
+  
+    #eval at min
+  lasso_test_preds_min <- predict(lasso_cv, newx = testx, s = 'lambda.min', type = 'response')
+  lasso_test_classes_min <- predict(lasso_cv, newx = testx, s = 'lambda.min', type = 'class')
+  lasso_test_assess_min <- assess.glmnet(lasso_cv, newx = testx, newy = testy, family = family)
+
+  lasso_nonzero_all_classes_min <- lapply(coef(lasso_cv, 'lambda.min'), function(x) which(x != 0)) %>% unlist() %>% unique() -1 #subtract one because intercept is always included first
+  
+  fold_results$lasso = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                               list(length(lasso_nonzero_all_classes_min)-1, #subtract 1 to exclude intercept from count
+                                    colnames(testx)[lasso_nonzero_all_classes_min] %>% paste(collapse = ';'),
+                                    1-lasso_cv$cvm[lasso_cv$index['min',]],
+                                    1-lasso_test_assess_min$class[1], #do 1-measure for these - it's inacuracy it measures
+                                    length(testy),
+                                    testy,
+                                    as.numeric(lasso_test_classes_min),
+                                    as.data.frame(lasso_test_preds_min[,,1]) %>% 
+                                      dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                    test_idx,
+                                    case_weights, #weights used in training
+                                    lasso_cv),  
+                              SIMPLIFY = F)
+
+  #Elastic-NET
+  
+  elasticnet_cv <- cv.glmnet(trainx, trainy, type.measure = measure, family = family, nfolds = 5, weights = case_weights, 
+                             alpha = 0.5)
+  
+  #eval at min
+  enet_test_preds_min <- predict(elasticnet_cv, newx = testx, s = 'lambda.min', type = 'response')
+  enet_test_classes_min <- predict(elasticnet_cv, newx = testx, s = 'lambda.min', type = 'class')
+  enet_test_assess_min <- assess.glmnet(elasticnet_cv, newx = testx, newy = testy, family = family)
+
+  enet_nonzero_all_classes_min <- lapply(coef(elasticnet_cv, 'lambda.min'), function(x) which(x != 0)) %>% 
+    unlist() %>% unique() -1 #subtract one because intercept is always included first
+ 
+ fold_results$enet = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                               list(length(enet_nonzero_all_classes_min)-1, #subtract 1 to exclude intercept from count
+                                    colnames(testx)[enet_nonzero_all_classes_min] %>% paste(collapse = ';'),
+                                    1-elasticnet_cv$cvm[elasticnet_cv$index['min',]],
+                                    1-enet_test_assess_min$class[1], #do 1-measure for these - it's inacuracy it measures
+                                    length(testy),
+                                    testy,
+                                    as.numeric(enet_test_classes_min),
+                                    as.data.frame(enet_test_preds_min[,,1]) %>% 
+                                      dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                    test_idx,
+                                    case_weights, #weights used in training
+                                    elasticnet_cv),  
+                              SIMPLIFY = F)
+  
+  
+  #mRMR
+ 
+  mrmr_train_fold <- cbind(trainx, target  = as.numeric(trainy)) %>% as.data.frame()
+  mr.d <- mRMR.data(mrmr_train_fold)
+  
+  #eval at min
+  
+  mr_out_min <- mRMR.classic(mr.d, target_indices = c(length(mrmr_train_fold)), 
+                             feature_count = n_variables_min) #num of features from fspls
+  
+  mrmr_selected_min <- mrmr_train_fold[,solutions(mr_out_min)[[1]]]
+  
+  if (is.null(dim(mrmr_selected_min))) { #if it's just a vector of values because only one feature has been selected
+    subset_x_data_test <- cbind(testx[,solutions(mr_out_min)[[1]]], 1)
+    mrmr_selected_min <- cbind(mrmr_selected_min, runif(n = nrow(trainx), min = 0.99, max = 1.01)) #add contant features (ones +- var) in case of just one feature being selected
+    colnames(mrmr_selected_min) <- c(colnames(mrmr_train_fold)[solutions(mr_out_min)[[1]]], 'null_feature')
+  } else {
+    subset_x_data_test <- testx[,colnames(mrmr_selected_min)]
+  }
+  
+  mrmr_ridge_min <- cv.glmnet(x = as.matrix(mrmr_selected_min), y = as.factor(trainy), family = family, alpha = 0, 
+                              type.measure = measure, nfolds = 5, weights = case_weights) 
+  
+
+  mrmr_test_preds_min <- predict(mrmr_ridge_min, newx  = subset_x_data_test, s = 'lambda.1se', 
+                             type = 'response')
+  mrmr_test_classes_min <- predict(mrmr_ridge_min, newx  = subset_x_data_test, s = 'lambda.1se', 
+                             type = 'class')
+  mrmr_test_assess_min <- assess.glmnet(mrmr_ridge_min, newx = subset_x_data_test, 
+                                    newy = testy, family = family)
+
+
+  
+  fold_results$mrmr = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                                          list(n_variables_min,
+                                            colnames(mrmr_selected_min)[1:n_variables_min] %>% paste(collapse = ';'),
+                                           1 - mrmr_ridge_min$cvm[mrmr_ridge_min$index['1se',]],
+                                           1 - mrmr_test_assess_min$class[1], #do 1-measure for these - it's inacuracy it measures
+                                           length(testy),
+                                           testy,
+                                           as.numeric(mrmr_test_classes_min),
+                                           as.data.frame(mrmr_test_preds_min[,,1]) %>% 
+                                             dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                          test_idx,
+                                           case_weights,
+                                           mrmr_ridge_min),  
+                                   SIMPLIFY = F)
+  
+ 
+ 
+  return(fold_results)
+}
+
+#function for naming results to save
+name_list <- function(...){
+  vnames <- as.character(match.call())[-1]
+  return(setNames(list(...), vnames))
+}
+
+#treatment 1 - ordinary normalisation
+coin_ordinary_norm_kfold_results <- mclapply(X = as.list(1:5), run_methods_on_fold_for_class, sepsis_discovery_data_ordinary_normalised, sepsis_data$y_data , sepsis.folds, log = T, scale = F)
+all_results <- name_list(coin_ordinary_norm_kfold_results)
+saveRDS(object = all_results, file = 'output/normalisation_class_test_all_approaches_RAPIDS.Rds')
+
+#treatment 2 - faux normalisation
+coin_faux_norm_kfold_results <- mclapply(X = as.list(1:5), run_methods_on_fold_for_class, sepsis_discovery_data_faux_normalised, sepsis_data$y_data,  sepsis.folds, log = T, scale = F)
+all_results <- name_list(coin_ordinary_norm_kfold_results, coin_faux_norm_kfold_results)
+saveRDS(object = all_results, file = 'output/normalisation_class_test_all_approaches_RAPIDS.Rds')
+
+#treatment 3 - ratio normalisation
+coin_ratio_norm_kfold_results <- mcmapply(FUN = function(i, x, y) {
+  run_methods_on_fold_for_class(i,x,y, sepsis.folds, log = F, scale = F) #log is false here because ratios are already logged
+  }, as.list(1:5), sepsis_discovery_data_ratio_normalised, rep(list(sepsis_data$y_data),5 ), SIMPLIFY = F)
+all_results <- name_list(coin_ordinary_norm_kfold_results, coin_faux_norm_kfold_results, coin_ratio_norm_kfold_results)
+saveRDS(object = all_results, file = 'output/normalisation_class_test_all_approaches_RAPIDS.Rds')
+
+```
+

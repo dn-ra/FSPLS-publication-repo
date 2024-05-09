@@ -1,0 +1,552 @@
+---
+title: "sepsis_full_model_train_and_validate"
+author: "Daniel Rawlinson"
+date: "2023-12-06"
+output: html_document
+---
+
+#libraries
+```{r}
+library(dplyr)
+library(caret)
+library(glmnet)
+library(mRMRe)
+library(ROCR)
+library(nnet)
+library(abind)
+library(pROC)
+library(tidyr)
+
+
+```
+
+#FS-PLS code load
+```{r}
+source('/home/danrawlinson/git/fspls/fspls_lachlan/fspls.R')
+
+pv_thresh = 0.01
+refit=FALSE
+```
+
+#Sundry functions
+```{r}
+#auc per class
+per_class_auc <- function(probs, true) {
+    auc_list <- list()
+    for (i in colnames(probs)) {
+    
+      faux_binary_class <- true
+      faux_binary_class[faux_binary_class != i] <- 'other'
+    
+      auc_obj <- pROC::roc(faux_binary_class, as.numeric(probs[,i]), auc = T)
+      auc_list[[i]] <- auc_obj$auc
+  }
+  
+  
+  auc_vals <- unlist(auc_list)
+  return(auc_vals)
+}
+
+#called from wasserstein
+.diffs_all<-function(v,ty){
+  m2=cbind(ty[-length(ty)], ty[-1])
+  ty2 =apply(m2,1,function(v)v[2]+v[1])
+  ty3 = ty2/sum(ty2)
+  m1 = cbind(v[-length(v)], v[-1], ty3)
+  sum(apply(m1,1,function(v2) (v2[1] - v2[2])*v2[3]))
+}
+
+
+wasserstein_plots <- function(probs, true_class) {
+      was_list <- list()
+      was_ggps <- list()
+    
+      for (level in colnames(probs)) {
+  
+    faux_binary_class <- true_class
+    case_idx <- faux_binary_class == level
+    faux_binary_class[-which(case_idx)] <- 0
+    faux_binary_class[case_idx] <- 1
+    
+    #auc_obj <- pROC::roc(faux_binary_class, as.numeric(probs[,i]) , auc = T)
+    #auc_list[[i]] <- auc_obj$auc
+    
+    
+    
+    #was_list[[i]] <-  #for wasserstein distance
+    y = faux_binary_class
+    yp2 = probs[,level]
+    ty= table(y)  ## assumes ty is ordered, which it should be 
+    nmey = as.numeric(names(ty))
+    range = c(nmey[1], nmey[length(nmey)])
+    names(nmey) = nmey
+    cdfs=lapply(nmey,function(yv){
+      ecdf(yp2[y==yv])
+    })
+    kns = lapply(cdfs,  stats::knots)
+    kn = unique(sort(unlist(kns)))
+    matr0 = cbind(c(range[1],kn),c(kn,range[2]))
+    midp = apply(matr0,1,mean) #midpoints on the knot vector
+    diffp = apply(matr0,1,function(v)v[2]-v[1]) #distances between the knot vector values
+    matr = as.matrix(data.frame(lapply(cdfs, function(cdf) cdf(midp)))) #cdfs of the two classes evaluated at midps
+    
+    dimnames(matr)[[2]] = names(cdfs) #names of the classes (0,1)
+    dimnames(matr)[[1]] = c(range[1], kn) #x values where the cdfs have been evaluated
+    matr_plot <- matr %>% as.data.frame %>% tibble::rownames_to_column(var = 'x') %>% tidyr::pivot_longer(cols = c('0','1')) %>% mutate(x = as.numeric(x))
+    #print(matr)
+    diff = apply(matr,1,function(v) .diffs_all(v, ty)) 
+    was_list[[level]] <- c(NA,sum( diffp * diff),NA) #integrating below the diff values
+    was_ggps[[level]] <- ggplot(matr_plot, aes(x = x, y = value, color = name)) + geom_point(size = 0.5, stroke = NA) + 
+      ggtitle(label = paste('prob cdf, class =', level)) + 
+      annotate('text', x = 0.00, y = 1.0, label = paste('diff =', round(was_list[[level]][2], 3)), size = 4*0.36, hjust = 0) +
+      theme_minimal() +
+      theme(text = element_text(size = 6), axis.title = element_blank(), axis.text.x = element_text(angle = 40, vjust = 1, hjust=1)) + coord_cartesian(xlim= c(0,1))
+    }
+    return(list(probs = was_list, plots = was_ggps))
+  }
+
+
+```
+
+#Data load
+```{r}
+sepsis_data <- readRDS('input/coin_data/coin_multiclass_data.prepd.Rds')
+sepsis_validation <- readRDS('input/coin_data/coin_validaiton_data.prepd.Rds')
+
+```
+
+#No folds. Just train for normalisation and discrimination
+##Normalisation train
+```{r}
+feature_means_discovery <- apply(sepsis_data$X_data, 2, mean, trim = 0.05) %>% sort(decreasing = T) 
+feature_means_validation <- apply(sepsis_validation$X_data, 2, mean, trim = 0.05) %>% sort(decreasing = T) 
+
+common_in_both_cohorts <- intersect(names(feature_means_discovery[1:10000]), names(feature_means_validation[1:10000]))
+
+X_data <- sepsis_data$X_data[,common_in_both_cohorts]
+y_data <- rowSums(sepsis_data$X_data)
+
+X_validate <- sepsis_validation$X_data[,common_in_both_cohorts]
+```
+
+```{r}
+options('family' = 'gaussian')
+
+trainx <- log1p(X_data)
+validate_x <- log1p(X_validate)
+
+trainy <- log1p(y_data)
+  
+fspls_train_data <- list(data = as.matrix(trainx), y = as.matrix(trainy))
+fspls_validation_data <- list(data = as.matrix(validate_x), y = NULL) 
+
+  #family is inferred from getOption. Think it's wiser to set family as an argument.
+fspls_model <- trainModel(trainOriginal = fspls_train_data, pv_thresh = pv_thresh, testOriginal = fspls_train_data, refit =refit, max = 2) #tried with 10 and 2 features is still the 1se solution
+
+    #which variable number to choose? Borrowing from glmnet's 1se idea
+  evals <- fspls_model$eval[2:(length(fspls_model$variables)+1),2]
+  eval_min <- min(evals) #now min because I want to minimise mse
+  eval_se <- sd(evals)
+  # if (length(fspls_model$variables) > 3) {
+  #   tolerable_acc = eval_min
+  # } else {
+    tolerable_acc <- eval_min + eval_se
+  #}
+  n_variables = which(evals <= tolerable_acc)[1]
+  
+  #preds for train library
+    train= preprocess(fspls_train_data, centralise = FALSE)
+  train_response <- pred(fspls_model$beta[1:n_variables,], fspls_model$variables[1:n_variables], const = fspls_model$constantTerm, Wall = fspls_model$Wall[1:n_variables, 1:n_variables], data= train, means = fspls_model$means[1:n_variables])
+  
+  #preds for validation library
+  validation = preprocess(fspls_validation_data, centralise = FALSE)
+  validation_response <- pred(fspls_model$beta[1:n_variables,], fspls_model$variables[1:n_variables], const = fspls_model$constantTerm, Wall = fspls_model$Wall[1:n_variables, 1:n_variables], data= validation, means = fspls_model$means[1:n_variables])#, Wall = fspls_model$Wall[1:n_variables, 1:n_variables])
+
+norm_features <- colnames(trainx)[fspls_model$variables[1:n_variables]]
+  
+#train_response is the log-tarnsformed predicted training data library size
+#validation response is now the new log-transformed validation library prediction
+#norm_features is the feature names to use for ratio norm matrix generation
+
+
+
+
+```
+
+#Generate new X_matrices for discrimination features selection
+```{r}
+ordinary_norm_discovery <- sweep(X_data, 1, STATS = y_data %>% {./1e6}, FUN = '/') %>% log1p()
+faux_norm_discovery <- sweep(X_data, 1, STATS = expm1(train_response) %>% {./1e6}, FUN = '/') %>% log1p()
+ratio_norm_discovery <- sapply(as.list(norm_features), 
+         function(normalising_feature) {
+           normed_counts <- apply(trainx, MARGIN = 2, 
+                 function(column) column - trainx[,normalising_feature])
+          colnames(normed_counts) <- paste0(colnames(normed_counts), '.normed_by.',normalising_feature)
+          return(normed_counts)
+         }, simplify = F) %>% {do.call(cbind, .)}
+
+```
+
+#run discovery signature generation on various normalisations
+```{r}
+options('family' = 'multinomial')
+
+#convert discovery y data to numeric
+sepsis_discovery_class <- as.numeric(sepsis_data$y_data)-1
+
+
+#setting test data to be identical to train data. Just want the models out of it
+ordinary_norm_train_set = list(data = as.matrix(ordinary_norm_discovery), y = as.matrix(sepsis_discovery_class))
+sepsis_ordinary_norm_fspls <- trainModel(trainOriginal = ordinary_norm_train_set, pv_thresh = pv_thresh, max = 10, pivot = 2, refit = refit, testOriginal = ordinary_norm_train_set)
+
+
+faux_norm_train_set = list(data = as.matrix(faux_norm_discovery), y = as.matrix(sepsis_discovery_class))
+sepsis_faux_norm_fspls <- trainModel(trainOriginal = faux_norm_train_set, pv_thresh = pv_thresh, max = 10, pivot = 2, refit = refit, testOriginal = faux_norm_train_set)
+
+ratio_norm_train_set = list(data = as.matrix(ratio_norm_discovery), y = as.matrix(sepsis_discovery_class))
+sepsis_ratio_norm_fspls <- trainModel(trainOriginal = ratio_norm_train_set, pv_thresh = pv_thresh, max = 10, pivot = 2, refit = refit, testOriginal = ratio_norm_train_set)
+
+fspls_norm_strageies_sepsis_models_to_save = list(ordinary = sepsis_ordinary_norm_fspls, faux = sepsis_faux_norm_fspls, ratio = sepsis_ratio_norm_fspls)
+
+#save models
+saveRDS(fspls_norm_strageies_sepsis_models_to_save, 'output/RAPIDS_various_norms_discovery_models_fspls.Rds')
+```
+
+#Model with LASSO, Elastic-Net, mRMR ( with weights )
+```{r}
+training_class_weights <- (1/prop.table(table(sepsis_discovery_class))) %>% {./sum(.)}
+case_weights <- training_class_weights[as.character(sepsis_discovery_class)]
+
+lasso_models_discovery <- lapply(list(ordinary_norm_discovery, faux_norm_discovery, ratio_norm_discovery), cv.glmnet, y =sepsis_discovery_class, alpha = 1, nfolds = 5, type.measure = 'deviance', family = 'multinomial', weights = case_weights)
+names(lasso_models_discovery) <- c('sepsis_ordinary_norm_lasso', 'sepsis_faux_norm_lasso', 'sepsis_ratio_norm_lasso')
+
+enet_models_discovery <- lapply(list(ordinary_norm_discovery, faux_norm_discovery, ratio_norm_discovery), cv.glmnet, y =sepsis_discovery_class, alpha = 0.5, nfolds = 5, type.measure = 'deviance', family = 'multinomial', weights = case_weights)
+names(enet_models_discovery) <- c('sepsis_ordinary_norm_enet', 'sepsis_faux_norm_enet', 'sepsis_ratio_norm_enet')
+
+#mrmr
+
+mrmr_models_discovery <- lapply(list(ordinary_norm_discovery, faux_norm_discovery, ratio_norm_discovery), function(trainx) {
+  mrmr_train <- cbind(trainx, target  = as.numeric(sepsis_discovery_class)) %>% as.data.frame()
+  mr.d <- mRMR.data(mrmr_train)
+  
+  #eval at min
+  
+  mr_out_min <- mRMR.classic(mr.d, target_indices = c(length(mrmr_train)), 
+                             feature_count = 10) #num of features from fspls
+  
+  mrmr_selected_min <- mrmr_train[,solutions(mr_out_min)[[1]]]
+  
+  #subset_x_data_test <- testx_normalised[,colnames(mrmr_selected_min)]
+
+  
+  mrmr_ridge_min <- cv.glmnet(x = as.matrix(mrmr_selected_min), y = as.factor(sepsis_discovery_class), family = 'multinomial', 
+                              alpha = 0, type.measure = 'deviance', nfolds = 5, weights = case_weights) 
+  
+
+  return(mrmr_ridge_min)
+})
+names(mrmr_models_discovery) <- c('sepsis_ordinary_norm_mrmr', 'sepsis_faux_norm_mrmr', 'sepsis_ratio_norm_mrmr')
+
+```
+
+
+#get training measure
+```{r}
+#optionally read back in models
+#fspls_norm_strageies_sepsis_models_to_save <- readRDS('../output/norm_strategy_discovery_models_fspls_sepsis.Rds')
+
+sepsis_ordinary_norm_fspls = fspls_norm_strageies_sepsis_models_to_save$ordinary
+sepsis_faux_norm_fspls = fspls_norm_strageies_sepsis_models_to_save$faux
+sepsis_ratio_norm_fspls = fspls_norm_strageies_sepsis_models_to_save$ratio
+
+
+ordinary_norm_train_probs <- pred(coeff = sepsis_ordinary_norm_fspls$beta,vars = sepsis_ordinary_norm_fspls$variables, data =  preprocess(ordinary_norm_train_set, centralise = F, pivot = 2), Wall = sepsis_ordinary_norm_fspls$Wall, const = sepsis_ordinary_norm_fspls$constantTerm, means = sepsis_ordinary_norm_fspls$means)
+
+ordinary_norm_train_probs_full_column <- cbind(1, exp(ordinary_norm_train_probs))%>% `colnames<-`(attr(ordinary_norm_train_probs, 'levs')) %>% sweep(., MARGIN = 1, STATS = rowSums(.), FUN  = '/')
+
+faux_norm_train_probs <- pred(coeff = sepsis_faux_norm_fspls$beta,vars = sepsis_faux_norm_fspls$variables, data =  preprocess(faux_norm_train_set, centralise = F, pivot = 2), Wall = sepsis_faux_norm_fspls$Wall, const = sepsis_faux_norm_fspls$constantTerm, means = sepsis_faux_norm_fspls$means)
+
+faux_norm_train_probs_full_column <- cbind(1, exp(faux_norm_train_probs))%>% `colnames<-`(attr(faux_norm_train_probs, 'levs')) %>% sweep(., MARGIN = 1, STATS = rowSums(.), FUN  = '/')
+
+
+ratio_norm_train_probs <- pred(coeff = sepsis_ratio_norm_fspls$beta,vars = sepsis_ratio_norm_fspls$variables, data =  preprocess(ratio_norm_train_set, centralise = F, pivot = 2), Wall = sepsis_ratio_norm_fspls$Wall, const = sepsis_ratio_norm_fspls$constantTerm, means = sepsis_ratio_norm_fspls$means)
+
+ratio_norm_train_probs_full_column <- cbind(1, exp(ratio_norm_train_probs)) %>% `colnames<-`(attr(ratio_norm_train_probs, 'levs')) %>% sweep(., MARGIN = 1, STATS = rowSums(.), FUN  = '/')
+  
+train_response <- data.frame(true = sepsis_discovery_class, 
+                          ordinary = liability(ordinary_norm_train_probs), 
+                          faux = liability(faux_norm_train_probs), 
+                          ratio = liability(ratio_norm_train_probs))
+
+cm_train_ordinary <- confusionMatrix(data = factor(train_response$ordinary), reference = factor(sepsis_discovery_class))
+cm_train_faux <- confusionMatrix(data = factor(train_response$faux), reference = factor(sepsis_discovery_class))
+cm_train_ratio <- confusionMatrix(data = factor(train_response$ratio), reference = factor(sepsis_discovery_class))
+
+train_auc_ordinary <- per_class_auc(probs = ordinary_norm_train_probs_full_column, sepsis_discovery_class)
+train_auc_faux <- per_class_auc(faux_norm_train_probs_full_column, sepsis_discovery_class)
+train_auc_ratio <- per_class_auc(ratio_norm_train_probs_full_column, sepsis_discovery_class)
+
+was_training_ordinary <- wasserstein_plots(probs = ordinary_norm_train_probs_full_column, sepsis_discovery_class)
+was_training_faux <- wasserstein_plots(probs = faux_norm_train_probs_full_column, sepsis_discovery_class)
+was_training_ratio <- wasserstein_plots(probs = ratio_norm_train_probs_full_column, sepsis_discovery_class)
+```
+#get training measure - alternative methods
+```{r}
+#needs mapply to match model with data prep
+lasso_train_preds <- mapply(FUN = function(model, data) predict(model, newx = data, s = 'lambda.1se', type = 'response'), lasso_models_discovery, list(ordinary_norm_discovery, faux_norm_discovery, ratio_norm_discovery), SIMPLIFY = F)
+
+enet_train_preds <- mapply(FUN = function(model, data) predict(model, newx = data, s = 'lambda.1se', type = 'response'), enet_models_discovery, list(ordinary_norm_discovery, faux_norm_discovery, ratio_norm_discovery), SIMPLIFY = F)
+
+mrmr_train_preds <- mapply(FUN = function(model, data) predict(model, newx = data[,rownames(model$glmnet.fit$beta[[1]])], s = 'lambda.1se', type = 'response'), mrmr_models_discovery, list(ordinary_norm_discovery, faux_norm_discovery, ratio_norm_discovery), SIMPLIFY = F)
+
+train_class_preds_other_methods <- lapply(list(lasso_train_preds, enet_train_preds, mrmr_train_preds), function(x) lapply(x, function(y) apply(y, 1, function(z) which(max(z) == z)-1)))
+
+train_cms_other_methods <- lapply(train_class_preds_other_methods, function(x) lapply(x, function(y) confusionMatrix(data = factor(y), reference = factor(sepsis_discovery_class))))
+
+train_aucs_other_methods <- lapply(list(lasso_train_preds, enet_train_preds, mrmr_train_preds), function(x) lapply(x, function(y) per_class_auc(probs = y[,,1], sepsis_discovery_class)))
+
+```
+
+
+#Evaluate on Validation data
+##Prep matrices
+```{r}
+validation_ordinary_norm <- sweep(X_validate, 1, STATS  = rowSums(sepsis_validation$X_data) %>% {./1e6}, FUN = '/') %>% log1p()
+validation_faux_norm <- sweep(X_validate, 1, STATS = validation_response %>% expm1() %>% {./1e6}, FUN = '/') %>% log1p()
+validation_ratio_norm <- sapply(as.list(norm_features), 
+         function(normalising_feature) {
+           normed_counts <- apply(validate_x, MARGIN = 2, 
+                 function(column) column - validate_x[,normalising_feature]) #log value feature - log value feature
+          colnames(normed_counts) <- paste0(colnames(normed_counts), '.normed_by.',normalising_feature)
+          return(normed_counts)
+         }, simplify = F) %>% {do.call(cbind, .)}
+```
+
+##run model predictions
+```{r}
+class_validate <- as.numeric(sepsis_validation$y_data)-1
+
+validation_ordinary_preprocess <- preprocess(list(data = as.matrix(validation_ordinary_norm), y = as.matrix(class_validate)), centralise = F, pivot = 2)
+validation_probs_ordinary <- pred(coeff = sepsis_ordinary_norm_fspls$beta[1:10,] ,
+                                 vars = sepsis_ordinary_norm_fspls$variables[1:10], 
+                                 data = validation_ordinary_preprocess, 
+                                 Wall = sepsis_ordinary_norm_fspls$Wall[1:10,1:10], 
+                                 const = sepsis_ordinary_norm_fspls$constantTerm, 
+                                 mean = sepsis_ordinary_norm_fspls$means[1:10])
+  
+validation_faux_preprocess <- preprocess(list(data = as.matrix(validation_faux_norm), y = as.matrix(class_validate)), centralise = F, pivot = 2)
+validation_probs_faux <- pred(coeff = sepsis_faux_norm_fspls$beta[1:10,] ,
+                                 vars = sepsis_faux_norm_fspls$variables[1:10], 
+                                 data = validation_faux_preprocess, 
+                                 Wall = sepsis_faux_norm_fspls$Wall[1:10,1:10], 
+                                 const = sepsis_faux_norm_fspls$constantTerm, 
+                                 mean = sepsis_faux_norm_fspls$means[1:10])
+
+validation_ratio_preprocess <- preprocess(list(data = as.matrix(validation_ratio_norm), y = as.matrix(class_validate)), centralise = F, pivot = 2)
+validation_probs_ratio <- pred(coeff = sepsis_ratio_norm_fspls$beta[1:10,] ,
+                                 vars = sepsis_ratio_norm_fspls$variables[1:10], 
+                                 data = validation_ratio_preprocess, 
+                                 Wall = sepsis_ratio_norm_fspls$Wall[1:10,1:10], 
+                                 const = sepsis_ratio_norm_fspls$constantTerm, 
+                                 mean = sepsis_ratio_norm_fspls$means[1:10])
+
+all_response <- data.frame(true = class_validate, ordinary = liability(validation_probs_ordinary), faux = liability(validation_probs_faux), ratio = liability(validation_probs_ratio))
+
+```
+
+#get validation predictions on alternative methods
+```{r}
+lasso_validation_preds <- mapply(FUN = function(model, data) predict(model, newx = data, s = 'lambda.1se', type = 'response'), lasso_models_discovery, list(validation_ordinary_norm, validation_faux_norm, validation_ratio_norm), SIMPLIFY = F)
+
+enet_validation_preds <- mapply(FUN = function(model, data) predict(model, newx = data, s = 'lambda.1se', type = 'response'), enet_models_discovery, list(validation_ordinary_norm, validation_faux_norm, validation_ratio_norm), SIMPLIFY = F)
+
+mrmr_validation_preds <- mapply(FUN = function(model, data) predict(model, newx = data[,rownames(model$glmnet.fit$beta[[1]])], s = 'lambda.1se', type = 'response'), mrmr_models_discovery, list(validation_ordinary_norm, validation_faux_norm, validation_ratio_norm), SIMPLIFY = F)
+
+
+validation_class_preds_other_methods <- lapply(list(lasso_validation_preds, enet_validation_preds, mrmr_validation_preds), function(x) lapply(x, function(y) apply(y, 1, function(z) which(max(z) == z)-1)))
+
+validation_cms_other_methods <- lapply(validation_class_preds_other_methods, function(x) lapply(x, function(y) confusionMatrix(data = factor(y), reference = factor(class_validate))))
+
+validation_aucs_other_methods <- lapply(list(lasso_validation_preds, enet_validation_preds, mrmr_validation_preds), function(x) lapply(x, function(y) per_class_auc(probs = y[,,1], class_validate)))
+
+```
+
+#build table of results for alternative methods
+```{r}
+reformat_validation_cms <- lapply(validation_cms_other_methods, function(x) lapply(x, function(y) y$byClass[,c('Sensitivity','Specificity')]))
+reformat_validation_cms <- lapply(reformat_validation_cms, FUN = function(x) mapply(function(data, name) {
+  data = as.data.frame(data, col.names = colnames(data))
+  data$type = name
+  data = tibble::rownames_to_column(data, var = 'class')
+  data = mutate(data, class = gsub('Class: ', '', class))
+  return(data)}, x, names(x), SIMPLIFY = F) %>% Reduce(rbind,.)) %>% Reduce(rbind, .)
+
+reformat_validation_aucs <- lapply(validation_aucs_other_methods, FUN = function(x) mapply(function(data, name) {
+  data = data.frame(auc = data)
+  data$type = name
+  data = tibble::rownames_to_column(data, var = 'class')
+  return(data)}, x, names(x), SIMPLIFY = F) %>% Reduce(rbind,.)) %>% Reduce(rbind, .)
+
+validation_metrics_other_methods <- full_join(reformat_validation_cms, reformat_validation_aucs) %>% mutate(source = 'validation')
+
+reformat_train_cms <- lapply(train_cms_other_methods, function(x) lapply(x, function(y) y$byClass[,c('Sensitivity','Specificity')]))
+reformat_train_cms <- lapply(reformat_train_cms, FUN = function(x) mapply(function(data, name) {
+  data = as.data.frame(data)
+  data$type = name
+  data = tibble::rownames_to_column(data, var = 'class')
+  data = mutate(data, class = gsub('Class: ', '', class))
+  return(data)}, x, names(x), SIMPLIFY = F) %>% Reduce(rbind,.)) %>% Reduce(rbind, .)
+
+reformat_train_aucs <- lapply(train_aucs_other_methods, FUN = function(x) mapply(function(data, name) {
+  data = data.frame(auc = data)
+  data$type = name
+  data = tibble::rownames_to_column(data, var = 'class')
+  return(data)}, x, names(x), SIMPLIFY = F) %>% Reduce(rbind,.)) %>% Reduce(rbind, .)
+
+
+train_metrics_other_methods <- full_join(reformat_train_cms, reformat_train_aucs) %>% mutate(source = 'train')
+
+all_other_methods_results_sepsis <- rbind.data.frame(train_metrics_other_methods, validation_metrics_other_methods) %>% tidyr::pivot_longer(cols = c(Sensitivity, Specificity, auc), names_to = 'metric') %>% tidyr::separate_wider_delim(type, delim = "_", names = c("condition", "norm", "dummy", "method"))
+
+```
+
+
+##evaluate
+```{r}
+
+#confusion matrices
+cm_ordinary <- caret::confusionMatrix(data = factor(all_response$ordinary, levels = c(0,1,2)), reference = factor(all_response$true))
+cm_faux <- caret::confusionMatrix(data = factor(all_response$faux, levels = c(0,1,2)), reference = factor(all_response$true))
+cm_ratio <- caret::confusionMatrix(data = factor(all_response$ratio, levels = c(0,1,2)), reference = factor(all_response$true))
+
+#multiclass auc
+auc_ordinary <- calcAUC(ypred = validation_probs_ordinary, y = class_validate)
+auc_faux <- calcAUC(ypred = validation_probs_faux, y = class_validate)
+auc_ratio <- calcAUC(ypred = validation_probs_ratio, y = class_validate)
+
+ordinary_probs_full_column <- cbind(1, exp(validation_probs_ordinary)) %>% `colnames<-`(attr(validation_probs_ordinary, 'levs')) %>% sweep(., MARGIN = 1, STATS = rowSums(.), FUN  = '/')
+faux_probs_full_column <- cbind(1, exp(validation_probs_faux)) %>% `colnames<-`(attr(validation_probs_faux, 'levs')) %>% sweep(., MARGIN = 1, STATS = rowSums(.), FUN  = '/')
+ratio_probs_full_column <- cbind(1, exp(validation_probs_ratio)) %>% `colnames<-`(attr(validation_probs_ratio, 'levs')) %>% sweep(., MARGIN = 1, STATS = rowSums(.), FUN  = '/')
+
+#auc per class
+
+per_class_ordinary <- per_class_auc(ordinary_probs_full_column, class_validate)
+per_class_faux <- per_class_auc(faux_probs_full_column, class_validate)
+per_class_ratio <- per_class_auc(ratio_probs_full_column, class_validate)
+```
+
+##wasserstein plots
+```{r}
+was_ordinary <- wasserstein_plots(ordinary_probs_full_column, class_validate)
+was_faux <- wasserstein_plots(faux_probs_full_column, class_validate)
+was_ratio <- wasserstein_plots(ratio_probs_full_column, class_validate)
+```
+
+#Get plots
+##Confusion
+```{r}
+
+all_cms <- rbind(cm_ordinary$table %>% as.data.frame() %>% mutate(norm = 'ordinary', type = 'validation'),
+cm_faux$table %>% as.data.frame() %>% mutate(norm = 'faux', type = 'validation'),
+cm_ratio$table %>% as.data.frame() %>% mutate(norm = 'ratio', type = 'validation'),
+cm_train_ordinary$table %>% as.data.frame() %>% mutate(norm = 'ordinary', type = 'train'),
+cm_train_faux$table %>% as.data.frame() %>% mutate(norm = 'faux', type = 'train'),
+cm_train_ratio$table %>% as.data.frame() %>% mutate(norm = 'ratio', type = 'train')) %>% 
+  group_by(type, norm, Reference) %>% mutate(Proportion_of_Reference = Freq/sum(Freq)) %>% mutate(Prediction = factor(Prediction, levels = c(2,1,0)), Reference = factor(Reference, levels = c(0,1,2)))
+
+ggplot(all_cms, aes(x = Reference, y = Prediction, fill = Proportion_of_Reference)) + geom_tile() + facet_grid(cols = vars(norm), rows = vars(type)) + geom_text(aes(label=Freq), size = 5*0.36) + scale_fill_gradient(low = 'white', high = "#009194", limits = c(0,1), name = 'Prop') + theme_minimal() +theme(text=element_text(size=5) )
+ggsave(filename = 'plots/RAPIDS_train_validate_various_norms_confusion_fspls.pdf', width = 4.4, height = 2.21)
+
+
+```
+
+##Metrics
+```{r}
+all_cm_metrics <- rbind(data.frame(cm_ordinary$byClass, norm = 'ordinary', type = 'validation') %>% tibble::rownames_to_column('class'),
+data.frame(cm_faux$byClass, norm = 'faux', type = 'validation') %>% tibble::rownames_to_column('class'),
+data.frame(cm_ratio$byClass, norm = 'ratio', type = 'validation') %>% tibble::rownames_to_column('class'),
+data.frame(cm_train_ordinary$byClass, norm = 'ordinary', type = 'train') %>% tibble::rownames_to_column('class'),
+data.frame(cm_train_faux$byClass, norm = 'faux', type = 'train') %>% tibble::rownames_to_column('class'),
+data.frame(cm_train_ratio$byClass, norm = 'ratio', type = 'train') %>% tibble::rownames_to_column('class')) %>% select(c(Sensitivity, Specificity, norm, type, class))
+
+all_aucs <- rbind(c(per_class_ordinary, 'validation', 'ordinary'),
+c(per_class_faux, 'validation', 'faux'),
+c(per_class_ratio, 'validation', 'ratio'),
+c(train_auc_ordinary, 'train', 'ordinary'),
+c(train_auc_faux, 'train', 'faux'),
+c(train_auc_ratio, 'train', 'ratio')) %>% as.data.frame() %>% `colnames<-`(c('Class: 2', 'Class: 0','Class: 1', 'type', 'norm')) %>% tidyr::pivot_longer(cols = starts_with('Class:'), names_to = 'class', values_to = 'auc') %>% mutate(auc = as.numeric(auc))
+
+all_metrics <- full_join(all_cm_metrics, all_aucs) %>% tidyr::pivot_longer(cols = c(Sensitivity, Specificity, auc), names_to = 'metric', values_to = 'value') %>% mutate(class = factor(class, levels = c('Class: 2','Class: 1','Class: 0')), value = round(value, digits = 2))
+
+ggplot(all_metrics, aes(x = metric, y = class, fill = value)) + geom_tile() + geom_text(aes(label = value), size = 5*0.36) + facet_grid(cols = vars(norm), rows = vars(type)) + theme_minimal() + theme(text = element_text(size = 5))
+ggsave(filename = 'plots/RAPIDS_train_validate_various_norms_metrics_fspls.pdf', width = 4.52, height = 2.21)
+```
+#Save results!
+```{r}
+saveRDS(list(cms = all_cms, metrics = all_cm_metrics), 'output/RAPIDS_train_and_validation_evaluation.Rds')
+```
+
+
+##Wasserstein
+```{r}
+validation_was_plots <- lapply(list(was_ordinary, was_faux, was_ratio), function(x) x$plots) %>% do.call(c, .)
+p <- patchwork::wrap_plots(validation_was_plots, ncol = 3) + patchwork::plot_layout(guides = 'collect')
+p_validation <- p + theme(legend.position = 'none')
+ggsave(p_validation, filename = 'plots/RAPIDS_train_validate_various_norms_validation_was_plots_fspls.pdf', width = 3.8, height = 4)
+
+
+train_was_plots <- lapply(list(was_training_ordinary, was_training_faux, was_training_ratio), function(x) x$plots) %>% do.call(c, .)
+p <- patchwork::wrap_plots(train_was_plots, ncol = 3) + patchwork::plot_layout(guides = 'collect')
+p_train <- p + theme(legend.position = 'none')
+ggsave(p_train, filename = 'plots/RAPIDS_train_validate_various_norms_train_was_plots_fspls.pdf', width = 3.8, height = 4)
+```
+
+#Plot other methods
+```{r}
+all_other_methods_results_sepsis %<>% mutate(class = factor(class, levels = c(2,1,0)))
+
+other_methods_results_table <- all_other_methods_results_sepsis %>% tidyr::pivot_wider(names_from = 'metric', values_from = 'value') %>% select(!c(condition, dummy, Sensitivity, Specificity)) %>% tidyr::pivot_wider(names_from = class, values_from = auc)
+write.table(other_methods_results_table, file = 'output/RAPIDS_train_validate_various_norms_other_methods.csv', sep = ',', quote = F, row.names = F)
+```
+
+#Dig into expression of FS-PLS features
+```{r}
+library(tidybulk)
+library(SummarizedExperiment)
+library(patchwork)
+
+#optional read back in models
+#fspls_norm_strageies_sepsis_models_to_save <- readRDS('coin_sepsis_outputs/norm_strategy_discovery_models_fspls_sepsis.Rds')
+ 
+sepsis_ordinary_norm_fspls = fspls_norm_strageies_sepsis_models_to_save$ordinary
+
+class_validate <- as.numeric(sepsis_validation$y_data)-1
+
+ordinary_feats <- names(sepsis_ordinary_norm_fspls$means)
+
+
+se_ordinary <- validation_ordinary_norm[,ordinary_feats] %>% sweep(MARGIN = 2, STATS = sepsis_ordinary_norm_fspls$means, FUN = "-") %>% {SummarizedExperiment(assays = list(data = t(.)))}
+colData(se_ordinary)$class <- factor(class_validate)
+rowData(se_ordinary)$source <- 'validation'
+tt_ordinary <- se_ordinary %>% tidybulk() %>% mutate(.feature = factor(.feature, levels = ordinary_feats))
+
+
+#train ordinary expression
+se_ordinary_train <- ordinary_norm_discovery[,ordinary_feats] %>% sweep(MARGIN = 2, STATS = sepsis_ordinary_norm_fspls$means, FUN = "-") %>% {SummarizedExperiment(assays = list(data = t(.)))}
+colData(se_ordinary_train)$class <- factor(sepsis_discovery_class)
+rowData(se_ordinary_train)$source <- 'train'
+tt_ordinary_train <- se_ordinary_train %>% tidybulk() %>% mutate(.feature = factor(.feature, levels = ordinary_feats))
+
+
+
+tt_ordinary_joined <- bind_rows(tt_ordinary, tt_ordinary_train) %>% mutate(source = factor(source, levels = c('train', 'validation')))
+
+
+
+box_ordinary_joined <- ggplot(tt_ordinary_joined, aes(x = class, y = data, fill = source)) + geom_boxplot(outlier.colour = NULL, outlier.size = 1) + facet_wrap(vars(.feature), ncol = 10) + theme_bw() + theme(axis.text.x = element_text(angle = 40, vjust = 0.5, hjust=1)) + scale_x_discrete(labels=c("Bacterial","Viral","NonInfect"))
+ggsave('plots/RAPIDS_feature_box_plot_ordinary_norm.pdf', box_ordinary_joined, width = 8, height =3)
+
+
+```
+
+

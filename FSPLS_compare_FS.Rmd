@@ -1,0 +1,292 @@
+---
+title: "FSPLS_compare_FS"
+author: "Daniel Rawlinson"
+date: "2024-04-18"
+output: html_document
+---
+
+#Libraries
+```{r}
+library(lars)
+library(dplyr)
+library(pROC)
+library(ROCR)
+library(glmnet)
+library(nnet)
+library(MASS)
+```
+
+#Golub
+```{r}
+
+golub_data <- readRDS('../input/golub_data/golub.prepd.Rds')
+
+
+golub_merged_x <- golub_data$data #total of 72 samples
+golub_merged_y <- golub_data$y
+
+auc_results <- list()
+auc_results <- list()
+
+
+set.seed(42)
+golub_folds <- caret::createFolds(y = golub_merged_y$x, k =5)
+
+
+for (i in 1:length(golub_folds)) {
+  train_idx <- golub_folds[-i] %>% unlist
+  test_idx <- golub_folds[[i]]
+  
+  fold_trainx <- golub_merged_x[train_idx,]
+  fold_testx <- golub_merged_x[test_idx,]
+  
+  fold_trainy <- golub_merged_y[train_idx,1]
+  fold_testy <- golub_merged_y[test_idx,1]
+  
+  golub.fs <- lars(as.matrix(fold_trainx), as.matrix(fold_trainy), type = 'forward.stagewise', max.steps = 2, normalize = T )
+  golub.test.met <- predict(golub.fs, newx = fold_testx)
+  
+  auc_results[[i]] <-  pROC::auc(as.matrix(fold_testy), golub.test.met$fit[,3]) #set to same number of features
+  
+  #golub.fspls <- trainModel(list(data = fold_trainx, y = fold_trainy), testOriginal = list(data = fold_testx, y = fold_testy))
+  
+  
+  #auc_results$fspls[[i]] <- golub.fspls$eval[3,8]
+}
+
+saveRDS(auc_results, file = 'output/golub_forward.stagewise_aucs_10_folds.Rds')
+
+```
+
+#Kaforou
+```{r}
+kaf_data <- readRDS('input/kaforou_data/kaforou_data.prepd.Rds')
+
+
+#do with k-fold
+set.seed(42)
+folds <- caret::createFolds(y = kaf_data$TB_idx, k = 5)
+
+vars_X <- kaf_data$data[kaf_data$TB_idx,] %>% {apply(., 2, var)} %>% sort(decreasing = T)
+
+auc_results <- list()
+
+
+for (i in 1:5) {
+  train_idx <- folds[-i] %>% unlist
+  test_idx <- folds[[i]]
+  
+  fold_trainx <- kaf_data$data[train_idx,]  %>% scale()
+  fold_testx <- kaf_data$data[test_idx,]  %>% scale()
+  
+
+  fold_trainy <- kaf_data$y[train_idx] %>% as.factor() %>% as.numeric()-1
+  fold_testy <- kaf_data$y[test_idx] %>% as.factor() %>% as.numeric()-1
+  
+  #var_sigs <- apply(fold_trainx, 2, function(x) glm(fold_trainy ~ x) %>% {summary(.)$coefficients[2,4] })
+  
+  
+  fold_trainx <- fold_trainx[,names(vars_X)[1:10000]]
+  fold_testx <- fold_testx[,names(vars_X)[1:10000]]
+  
+  fs <- lars(as.matrix(fold_trainx), as.matrix(fold_trainy), type = 'forward.stagewise', max.steps = 6, normalize = F)
+  test.met <- predict(fs, fold_testx)
+  
+  auc_results[[i]] <-  pROC::auc(as.matrix(fold_testy), test.met$fit[,7])
+  
+}
+
+saveRDS(auc_results, file = 'output/kaf_forward.stagewise_aucs.Rds')
+```
+
+#Ng
+```{r}
+
+ng_data <- readRDS('../input/ng_data/ng_data.prepd.Rds')
+set.seed(42)
+folds <- caret::createFolds(ng_data$y, k =5)
+
+vars_X <- ng_data$data %>% log1p() %>% {apply(., 2, var)} %>% sort(decreasing = T)
+
+
+log=T
+scale=F
+i =1
+
+aucs <- list()
+
+for (i in 1:length(folds)) {
+
+train_idx <- folds[-i] %>% unlist()
+test_idx <- folds[[i]]
+
+trainx <-  ng_data$data[train_idx,]
+testx <- ng_data$data[test_idx,] 
+
+trainy <- ng_data$y[train_idx] %>% as.numeric()
+testy <- ng_data$y[test_idx] %>% as.numeric() 
+
+lib.sizes_train_per_mill <-  rowSums(trainx) / 1e6
+lib.sizes_test_per_mill <- rowSums(testx) / 1e6
+
+trainx_normalised <- sweep(trainx, 1, STATS = lib.sizes_train_per_mill, FUN = '/') %>% {.[,names(vars_X)[1:10000]] } %>%
+  { if(log) log1p(.) else .} %>% 
+  {if (scale) scale(.) else .} 
+
+testx_normalised <- sweep(testx, 1, STATS = lib.sizes_test_per_mill, FUN = '/') %>% {.[,names(vars_X)[1:10000]] } %>%
+  { if(log) log1p(.) else .} %>% 
+  {if (scale) scale(.) else .} 
+
+#mod <- glm(class ~ ., data = as.data.frame(train_data), family = 'binomial')
+#mod.step <- stepAIC(mod, trace = F, direction = 'forward')
+
+
+lars.mod <- lars(as.matrix(trainx_normalised), as.matrix(trainy), use.Gram = F, normalize = F, type = 'forward.stagewise', max.steps = 6)
+new_preds <- predict(lars.mod, testx_normalised)
+
+aucs[[i]] <- pROC::auc(response = testy, predictor = as.numeric(new_preds$fit[,5]))
+
+}
+
+saveRDS(aucs, file = 'Ng_forward.stagewise_aucs.Rds')
+
+```
+#RAPIDS
+```{r}
+coin_data <- readRDS('input/coin_data/coin_multiclass_data.prepd.Rds')
+set.seed(42)
+folds <- caret::createFolds(coin_data$y_data, k =5)
+
+vars_X <- coin_data$X_data %>% log1p() %>% {apply(., 2, var)} %>% sort(decreasing = T)
+
+
+
+log=T
+scale=F
+i =1
+
+cms <- list()
+pred_class <- list()
+pred_probs <- list()
+true_class <- list()
+
+
+for (i in 1:length(folds)) {
+  
+  train_idx <- folds[-i] %>% unlist()
+  test_idx <- folds[[i]]
+  
+  trainx <-  coin_data$X_data[train_idx,]
+  testx <- coin_data$X_data[test_idx,] 
+  
+  trainy <-coin_data$y_data[train_idx] %>% as.factor() %>% as.numeric()-1
+  testy <- coin_data$y_data[test_idx] %>% as.factor() %>% as.numeric()-1
+  
+  lib.sizes_train_per_mill <-  rowSums(trainx) / 1e6
+  lib.sizes_test_per_mill <- rowSums(testx) / 1e6
+  
+  trainx_normalised <- sweep(trainx, 1, STATS = lib.sizes_train_per_mill, FUN = '/') %>% {.[,names(vars_X)[1:10000]] } %>%
+    { if(log) log1p(.) else .} %>% 
+    {if (scale) scale(.) else .} 
+  
+  testx_normalised <- sweep(testx, 1, STATS = lib.sizes_test_per_mill, FUN = '/') %>% {.[,names(vars_X)[1:10000]] } %>%
+    { if(log) log1p(.) else .} %>% 
+    {if (scale) scale(.) else .}
+  
+  colnames(trainx_normalised) <- make.names(colnames(trainx_normalised))
+  colnames(testx_normalised) <- make.names(colnames(testx_normalised))
+  
+  
+  training_class_weights <- (1/prop.table(table(trainy))) %>% {./sum(.)}
+  case_weights <- training_class_weights[as.character(trainy)]
+  
+  train_data <- data.frame(trainx_normalised, class = as.factor(trainy))
+  
+  start_model <- nnet::multinom(class~1, data = train_data, MaxNWts = 31000,weights = as.matrix(case_weights))
+  full_model <- multinom(class~., data = train_data, MaxNWts = 31000, weights = as.matrix(case_weights))
+  
+  step.model <- stepAIC(start_model, scope = list(lower = ~1, upper = formula(full_model)), direction="forward", steps = 10) # both means both forward and backward steps
+  
+  test_class <- predict(step.model, testx_normalised, type = 'class')
+  test_preds <- predict(step.model, testx_normalised, type = 'probs')
+  cm <- caret::confusionMatrix(test_class, reference = as.factor(testy))
+  
+  cms[[i]] <- cm
+  pred_class[[i]] <- test_class
+  pred_probs[[i]] <- test_preds
+  true_class[[i]] <- testy
+
+  
+}
+
+saveRDS(list(cms = cms, pred_class = pred_class, pred_probs = pred_probs, true_class = true_class), 'output/RAPIDS_stepAIC_results.Rds')
+
+```
+
+#Alvez
+```{r}
+alvez_data <- readRDS('input/alvez_data/alvez_data.prepd.Rds')
+set.seed(42)
+folds <- caret::createFolds(alvez_data$y, k =5)
+
+X_data = alvez_data$data
+y_data = alvez_data$y %>% as.factor()
+
+log=F
+scale=F
+
+cms <- list()
+pred_class <- list()
+pred_probs <- list()
+true_class <- list()
+
+for (i in 1:length(folds)) {
+  
+  train_idx <- folds[-i] %>% unlist()
+  test_idx <- folds[[i]]
+  
+  trainx <-  X_data[train_idx,] %>%
+    { if(log) log1p(.) else .} %>% 
+    {if (scale) scale(.) else .} 
+  
+  imputation_model <- caret::preProcess(trainx, method = 'knnImpute',k=10)
+  trainx <- predict(imputation_model, trainx)
+  
+  
+  #tretrieve testing samples and impute missing from model of trainx
+  testx <- X_data[test_idx,] %>%
+    { if(log) log1p(.) else .} %>% 
+    {if (scale) scale(.) else .} 
+  
+  testx <- predict(imputation_model, testx)
+  
+  #retreive test and train y data and encode as numeric
+  trainy <- y_data[train_idx] %>% as.numeric()-1
+  testy <- y_data[test_idx] %>% as.numeric()-1 
+  
+  #calculate sample weights
+  training_class_weights <- (1/prop.table(table(trainy))) %>% {./sum(.)}
+  case_weights <- training_class_weights[as.character(trainy)]
+  
+  #stepAIC
+  
+  train_data <- data.frame(trainx, class = as.factor(trainy))
+  
+  start_model <- nnet::multinom(class~1, data = train_data,weights = as.matrix(case_weights), MaxNWts = 10000,)
+  full_model <- multinom(class~., data = train_data, weights = as.matrix(case_weights), MaxNWts = 10000,)
+  
+  step.model <- stepAIC(start_model, scope = list(lower = ~1, upper = formula(full_model)), direction="forward", steps = 8) # both means both forward and backward steps
+  
+  test_class <- predict(step.model, testx, type = 'class')
+  test_preds <- predict(step.model, testx, type = 'probs')
+  cm <- caret::confusionMatrix(test_class, reference = as.factor(testy))
+  
+  cms[[i]] <- cm
+  pred_class[[i]] <- test_class
+  pred_probs[[i]] <- test_preds
+  true_class[[i]] <- testy
+  
+}
+saveRDS(list(cms = cms, pred_class = pred_class, pred_probs = pred_probs, true_class = true_class), 'output/alvez_stepAIC_results.Rds')
+```
+

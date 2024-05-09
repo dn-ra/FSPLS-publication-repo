@@ -1,0 +1,759 @@
+---
+title: "FSPLS_multiclass_datasets"
+author: "Daniel Rawlinson"
+date: "2024-04-17"
+output: html_document
+---
+
+#load libraries
+```{r}
+library(magrittr)
+library(ROCR)
+library(glmnet)
+library(mRMRe)
+library(nnet)
+library(caret)
+library(dplyr)
+library(GEOquery)
+library(parallel)
+library(ggplot2)
+library(dplyr)
+library(spatstat)
+library(brglm2)
+library(reshape2)
+library(pROC)
+```
+
+#load fs-pls code
+```{r}
+source('/home/danrawlinson/git/fspls/fspls_lachlan/fspls.R')
+
+pv_thresh = 0.01
+refit=FALSE
+
+```
+
+#Load RAPIDS data
+```{r}
+sepsis_data <- readRDS('../input/coin_data/coin_multiclass_data.prepd.Rds')
+```
+
+#Analyse RAPIDS dataset
+```{r}
+set.seed(42)
+sepsis_folds <- caret::createFolds(y = sepsis_data$y_data, k =5)
+
+family= 'multinomial'
+measure = 'deviance'
+
+options('family' = family)
+
+
+#arrange data by variance
+vars_X <- sepsis_data$X_data %>% log1p() %>% {apply(., 2, var)} %>% sort(decreasing = T)
+
+
+#init reporting structure
+fold_structure <- list('nfeatures' = numeric(), 'selected_features' = vector(), 'train_acc' = numeric(), 
+                       'test_acc' = numeric(), 
+                       'nsamples_test' = numeric(), 'true' = vector(), 'fitted' = vector(), 'fitted_probs' = data.frame(), 
+                       'test_idx' = vector(), 'weights' = vector(), 'model' = NULL)
+
+
+methods <- c('lasso','elastic_net','fspls','mrmr')
+
+
+run_methods_on_fold_for_class_RAPIDS <- function(i, X_data, y_data, folds, log = FALSE, scale = FALSE, weights = FALSE, met = 'dev', pivot) {
+#for (i in 1:length(sepsis_folds)) {
+
+if (!(met %in% c("rms", "auc", "acc", "dev"))) { #should introduce multinomial deviance as a training metric
+    stop("Invalid value for 'option'. Choose 'rms', 'auc', 'acc', or 'dev'.")
+  }
+  
+  fold_results <- list() #will have 4 entries for each method, and two entries for each evaluation: one for min and one for 1se
+  
+    #-----------Prepare data folds---------------#
+  
+  #IDs for train and fold partitions
+  train_idx <- folds[-i] %>% unlist()
+  test_idx <- folds[[i]]
+  
+  #retrieve training samples 
+  trainx <-  X_data[train_idx,]
+  testx <- X_data[test_idx,] 
+
+  trainy <-y_data[train_idx] %>% as.numeric()-1
+  testy <- y_data[test_idx] %>% as.numeric()-1 
+
+
+  training_class_weights <- (1/prop.table(table(trainy))) %>% {./sum(.)}
+  case_weights <- training_class_weights[as.character(trainy)]
+  
+  #setting weights to NULL for non-weighted models comparison
+  if (weights == F) { case_weights = NULL }
+
+  lib.sizes_train_per_mill <-  rowSums(trainx) / 1e6
+  lib.sizes_test_per_mill <- rowSums(testx) / 1e6
+  
+  trainx_normalised <- sweep(trainx, 1, STATS = lib.sizes_train_per_mill, FUN = '/') %>% {.[,names(vars_X)[1:10000]] } %>%
+    { if(log) log1p(.) else .} %>% 
+  {if (scale) scale(.) else .} 
+
+  testx_normalised <- sweep(testx, 1, STATS = lib.sizes_test_per_mill, FUN = '/') %>% {.[,names(vars_X)[1:10000]] } %>%
+    { if(log) log1p(.) else .} %>% 
+    {if (scale) scale(.) else .} 
+  
+  #-----------FSPLS---------------#
+  fold_results$fspls <- list()
+  
+  fspls_train_data <- list(data = as.matrix(trainx_normalised), y = as.matrix(trainy))
+  fspls_test_data <- list(data = as.matrix(testx_normalised), y = as.matrix(testy))
+  #family is inferred from getOption. Think it's wiser to set family as an argument.
+  model_fspls <- trainModel(trainOriginal = fspls_train_data, pv_thresh = pv_thresh, testOriginal = fspls_test_data, refit =refit, max = 10, pivot = pivot, weights = case_weights) #pivot is treated as string by 'relevel' function
+
+  #which variable number to choose? Borrowing from glmnet's 1se idea
+  metric_col <- which(c('rms','auc','acc', 'dev') == met)
+  train_col_metric <- metric_col + 1
+  test_col_metric <- train_col_metric + 5
+  
+  evals <- model_fspls$eval[2:(length(model_fspls$variables)+1),train_col_metric] #index for corresponds to trainig accuracy
+
+  eval_min <- min(evals)
+  eval_se <- sd(evals)
+  if (length(model_fspls$variables) < 3) {
+    tolerable_acc = eval_min
+  } else{
+      tolerable_acc <- eval_min + eval_se
+  }
+  n_variables_min= which(evals == eval_min)[1]
+  n_variables_1se = which(evals <= tolerable_acc)[1]
+
+  #fspls preds
+  #preprocess test data to add 'levs' attribute and set pivot level
+  test = preprocess(fspls_test_data, centralise = FALSE, pivot=pivot) #make sure pivot matches that used in `trainModel`
+
+  #eval at min features
+  test_response_min <- pred(model_fspls$beta[1:n_variables_min,], 
+                          model_fspls$variables[1:n_variables_min], 
+                          const = model_fspls$constantTerm, 
+                          Wall = model_fspls$Wall[1:n_variables_min, 1:n_variables_min], 
+                          data= test, 
+                          means = model_fspls$means[1:n_variables_min])
+  test_preds_min <- liability(test_response_min)
+  
+    test_response_min_return <- cbind(1, exp(test_response_min)) %>% `colnames<-`(attr(test_response_min, 'levs')) %>% {apply(., 1, .prob)} %>% t()
+
+
+  fspls_best_feature_list_min <- colnames(testx)[model_fspls$variables[1:n_variables_min]]
+
+  fold_results$fspls$min = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                              list(n_variables_min, #number of variables
+                                   fspls_best_feature_list_min %>% paste(collapse = ';'), #variable names
+                                   evals[n_variables_min], #train metric
+                                   model_fspls$eval[n_variables_min+1,test_col_metric], #test metric
+                                   length(testy), #number of samples
+                                   testy, #true test values
+                                   as.numeric(test_preds_min), #fitted values (class)
+                                   test_response_min_return, #fitted probabilities
+                                   test_idx, #sample ids used for test
+                                   case_weights, #weights used in training
+                                   model_fspls),  #store the model
+                              SIMPLIFY = F)
+  
+  #eval at 1se features
+  test_response_1se <- pred(model_fspls$beta[1:n_variables_1se,], 
+                          model_fspls$variables[1:n_variables_1se], 
+                          const = model_fspls$constantTerm, 
+                          Wall = model_fspls$Wall[1:n_variables_1se, 1:n_variables_1se], 
+                          data= test, 
+                          means = model_fspls$means[1:n_variables_1se])
+  test_preds_1se <- liability(test_response_1se)
+  
+  test_response_1se_return <- cbind(1, exp(test_response_1se)) %>% `colnames<-`(attr(test_response_1se, 'levs')) %>% {apply(.,1, .prob)} %>% t()
+
+  fspls_best_feature_list_1se <- colnames(testx)[model_fspls$variables[1:n_variables_1se]]
+
+  fold_results$fspls$`1se` = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                              list(n_variables_1se, #number of variables
+                                   fspls_best_feature_list_1se %>% paste(collapse = ';'),#variable names
+                                   evals[n_variables_1se],#train metric
+                                   model_fspls$eval[n_variables_1se+1,test_col_metric],#test metric
+                                   length(testy),#number of samples
+                                   testy,#true test values
+                                   as.numeric(test_preds_1se),#fitted values (class)
+                                   test_response_1se_return,#fitted probabilities
+                                   test_idx,#sample ids used for test
+                                   case_weights, #weights used in training
+                                   model_fspls),  #store the model
+
+                              SIMPLIFY = F)
+  
+
+  
+  #-----------LASSO---------------#
+  fold_results$lasso <- list()
+  lasso_cv <- cv.glmnet(trainx_normalised, trainy, type.measure = measure, family = family, nfolds = 5, weights = case_weights)
+  #eval_lasso <- assess.glmnet(lasso_cv, newx = testx, newy = testy)
+  
+  #eval at min
+  lasso_test_preds_min <- predict(lasso_cv, newx = testx_normalised, s = 'lambda.min', type = 'response')
+  lasso_test_classes_min <- predict(lasso_cv, newx = testx_normalised, s = 'lambda.min', type = 'class')
+  lasso_test_assess_min <- assess.glmnet(lasso_cv, newx = testx_normalised, newy = testy, family = family)
+
+  lasso_nonzero_all_classes_min <- lapply(coef(lasso_cv, 'lambda.min'), function(x) which(x != 0)) %>% unlist() %>% unique() -1 #subtract one because intercept is always included first
+ 
+ fold_results$lasso$min = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                               list(length(lasso_nonzero_all_classes_min)-1, #subtract 1 to exclude intercept from count
+                                    colnames(testx_normalised)[lasso_nonzero_all_classes_min] %>% paste(collapse = ';'),
+                                    1-lasso_cv$cvm[lasso_cv$index['min',]],
+                                    1-lasso_test_assess_min$class[1], #do 1-measure for these - it's inacuracy it measures
+                                    length(testy),
+                                    testy,
+                                    as.numeric(lasso_test_classes_min),
+                                    as.data.frame(lasso_test_preds_min[,,1]) %>% 
+                                      dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                    test_idx,
+                                    case_weights, #weights used in training
+                                    lasso_cv),  
+                              SIMPLIFY = F)
+  
+ #eval at 1se 
+  lasso_test_preds_1se <- predict(lasso_cv, newx = testx_normalised, s = 'lambda.1se', type = 'response')
+  lasso_test_classes_1se <- predict(lasso_cv, newx = testx_normalised, s = 'lambda.1se', type = 'class')
+  lasso_test_assess_1se <- assess.glmnet(lasso_cv, newx = testx_normalised, newy = testy, family = family)
+
+  lasso_nonzero_all_classes_1se <- lapply(coef(lasso_cv, 'lambda.1se'), function(x) which(x != 0)) %>% 
+    unlist() %>% unique() -1 #subtract one because intercept is always included first
+ 
+ fold_results$lasso$`1se` = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                             list(length(lasso_nonzero_all_classes_1se)-1, #subtract 1 to exclude intercept from count
+                                  colnames(testx_normalised)[lasso_nonzero_all_classes_1se] %>% paste(collapse = ';'),
+                                  1-lasso_cv$cvm[lasso_cv$index['1se',]],
+                                  1-lasso_test_assess_1se$class[1], #do 1-measure for these - it's inacuracy it measures
+                                  length(testy),
+                                  testy,
+                                  as.numeric(lasso_test_classes_1se),
+                                  as.data.frame(lasso_test_preds_1se[,,1]) %>% 
+                                    dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                  test_idx,
+                                  case_weights, #weights used in training
+                                  lasso_cv),  
+                              SIMPLIFY = F)
+ 
+ #-----------Elastic-Net---------------#
+  fold_results$enet <- list()
+  
+  elasticnet_cv <- cv.glmnet(trainx_normalised, trainy, type.measure = measure, family = family, nfolds = 5, weights = case_weights, 
+                             alpha = 0.5)
+  
+  #eval at min
+  enet_test_preds_min <- predict(elasticnet_cv, newx = testx_normalised, s = 'lambda.min', type = 'response')
+  enet_test_classes_min <- predict(elasticnet_cv, newx = testx_normalised, s = 'lambda.min', type = 'class')
+  enet_test_assess_min <- assess.glmnet(elasticnet_cv, newx = testx_normalised, newy = testy, family = family)
+
+  enet_nonzero_all_classes_min <- lapply(coef(elasticnet_cv, 'lambda.min'), function(x) which(x != 0)) %>% 
+    unlist() %>% unique() -1 #subtract one because intercept is always included first
+ 
+ fold_results$enet$min = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                               list(length(enet_nonzero_all_classes_min)-1, #subtract 1 to exclude intercept from count
+                                    colnames(testx_normalised)[enet_nonzero_all_classes_min] %>% paste(collapse = ';'),
+                                    1-elasticnet_cv$cvm[elasticnet_cv$index['min',]],
+                                    1-enet_test_assess_min$class[1], #do 1-measure for these - it's inacuracy it measures
+                                    length(testy),
+                                    testy,
+                                    as.numeric(enet_test_classes_min),
+                                    as.data.frame(enet_test_preds_min[,,1]) %>% 
+                                      dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                    test_idx,
+                                    case_weights, #weights used in training
+                                    elasticnet_cv),  
+                              SIMPLIFY = F)
+  
+ #eval at 1se 
+  enet_test_preds_1se <- predict(elasticnet_cv, newx = testx_normalised, s = 'lambda.1se', type = 'response')
+  enet_test_classes_1se <- predict(elasticnet_cv, newx = testx_normalised, s = 'lambda.1se', type = 'class')
+  enet_test_assess_1se <- assess.glmnet(elasticnet_cv, newx = testx_normalised, newy = testy, family = family)
+
+  enet_nonzero_all_classes_1se <- lapply(coef(elasticnet_cv, 'lambda.1se'), function(x) which(x != 0)) %>% 
+    unlist() %>% unique() -1 #subtract one because intercept is always included first
+ 
+ fold_results$enet$`1se` = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                             list(length(enet_nonzero_all_classes_1se)-1, #subtract 1 to exclude intercept from count
+                                  colnames(testx_normalised)[enet_nonzero_all_classes_1se] %>% paste(collapse = ';'),
+                                  1-elasticnet_cv$cvm[elasticnet_cv$index['1se',]],
+                                  1-enet_test_assess_1se$class[1], #do 1-measure for these - it's inacuracy it measures
+                                  length(testy),
+                                  testy,
+                                  as.numeric(enet_test_classes_1se),
+                                  as.data.frame(enet_test_preds_1se[,,1]) %>% 
+                                    dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                  test_idx,
+                                  case_weights, #weights used in training
+                                  elasticnet_cv),  
+                              SIMPLIFY = F)
+ 
+  #-----------MRMR---------------#
+ 
+ fold_results$mrmr <- list()
+ 
+  mrmr_train_fold <- cbind(trainx_normalised, target  = as.numeric(trainy)) %>% as.data.frame()
+  mr.d <- mRMR.data(mrmr_train_fold)
+  
+  #eval at min
+  
+  mr_out_min <- mRMR.classic(mr.d, target_indices = c(length(mrmr_train_fold)), 
+                             feature_count = n_variables_min) #num of features from fspls
+  
+  mrmr_selected_min <- mrmr_train_fold[,solutions(mr_out_min)[[1]]]
+  
+  if (is.null(dim(mrmr_selected_min))) { #if it's just a vector of values because only one feature has been selected
+    subset_x_data_test <- cbind(testx_normalised[,solutions(mr_out_min)[[1]]], 1)
+    mrmr_selected_min <- cbind(mrmr_selected_min, runif(n = nrow(trainx_normalised), min = 0.99, max = 1.01)) #add contant features (ones +- var) in case of just one feature being selected
+    colnames(mrmr_selected_min) <- c(colnames(mrmr_train_fold)[solutions(mr_out_min)[[1]]], 'null_feature')
+  } else {
+    subset_x_data_test <- testx_normalised[,colnames(mrmr_selected_min)]
+  }
+  
+  mrmr_ridge_min <- cv.glmnet(x = as.matrix(mrmr_selected_min), y = as.factor(trainy), family = family, alpha = 0, 
+                              type.measure = measure, nfolds = 5, weights = case_weights) 
+  
+
+  mrmr_test_preds_min <- predict(mrmr_ridge_min, newx  = subset_x_data_test, s = 'lambda.1se', 
+                             type = 'response')
+  mrmr_test_classes_min <- predict(mrmr_ridge_min, newx  = subset_x_data_test, s = 'lambda.1se', 
+                             type = 'class')
+  mrmr_test_assess_min <- assess.glmnet(mrmr_ridge_min, newx = subset_x_data_test, 
+                                    newy = testy, family = family)
+
+
+  
+  fold_results$mrmr$min = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                                          list(n_variables_min,
+                                            colnames(mrmr_selected_min)[1:n_variables_min] %>% paste(collapse = ';'),
+                                           1 - mrmr_ridge_min$cvm[mrmr_ridge_min$index['1se',]],
+                                           1 - mrmr_test_assess_min$class[1], #do 1-measure for these - it's inacuracy it measures
+                                           length(testy),
+                                           testy,
+                                           as.numeric(mrmr_test_classes_min),
+                                           as.data.frame(mrmr_test_preds_min[,,1]) %>% 
+                                             dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                          test_idx,
+                                           case_weights,
+                                           mrmr_ridge_min),  
+                                   SIMPLIFY = F)
+ 
+  #eval at 1se
+  
+    mr_out_1se <- mRMR.classic(mr.d, target_indices = c(length(mrmr_train_fold)), 
+                             feature_count = n_variables_1se) #num of features from fspls
+  
+  mrmr_selected_1se <- mrmr_train_fold[,solutions(mr_out_1se)[[1]]]
+  
+  if (is.null(dim(mrmr_selected_1se))) {
+    subset_x_data_test <- cbind(testx_normalised[,solutions(mr_out_1se)[[1]]], 1)
+    mrmr_selected_1se <- cbind(mrmr_selected_1se, runif(n = nrow(trainx_normalised), min = 0.99, max = 1.01)) #add contant features (ones +- var) in case of just one feature being selected
+    colnames(mrmr_selected_1se) <- c(colnames(mrmr_train_fold)[solutions(mr_out_1se)[[1]]], 'null_feature')
+    #colnames(subset_x_data_test) <- colnames(mrmr_selected_1se)
+  } else {
+    subset_x_data_test <- testx_normalised[,colnames(mrmr_selected_1se)]
+  }
+  
+  mrmr_ridge_1se <- cv.glmnet(x = as.matrix(mrmr_selected_1se), y = as.factor(trainy), family = family, alpha = 0, 
+                              type.measure = measure, nfolds = 5) 
+  
+  mrmr_test_preds_1se <- predict(mrmr_ridge_1se, newx  = subset_x_data_test, s = 'lambda.1se', 
+                             type = 'response')
+  mrmr_test_classes_1se <- predict(mrmr_ridge_1se, newx  = subset_x_data_test, s = 'lambda.1se', 
+                             type = 'class')
+  mrmr_test_assess_1se <- assess.glmnet(mrmr_ridge_1se, newx = subset_x_data_test, 
+                                    newy = testy, family = family)
+
+
+  fold_results$mrmr$`1se` = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                                          list(n_variables_1se,
+                                            colnames(mrmr_selected_1se)[1:n_variables_1se] %>% paste(collapse = ';'),
+                                           1 - mrmr_ridge_1se$cvm[mrmr_ridge_1se$index['1se',]],
+                                           1 - mrmr_test_assess_1se$class[1], #do 1-measure for these - it's inacuracy it measures
+                                           length(testy),
+                                           testy,
+                                           as.numeric(mrmr_test_classes_1se),
+                                           as.data.frame(mrmr_test_preds_1se[,,1]) %>% 
+                                             dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                           test_idx,
+                                           case_weights,
+                                           mrmr_ridge_1se),  
+                                   SIMPLIFY = F)
+  
+  
+  return(fold_results)
+}
+
+kfold_results_unweighted <- mclapply(X = as.list(1:5), run_methods_on_fold_for_class_RAPIDS, X_data = sepsis_data$X_data, y_data = sepsis_data$y_data, folds = sepsis_folds, log = T, scale = F, weights = F, met = 'dev', pivot = 2)
+
+kfold_results_weighted <- mclapply(X = as.list(1:5), run_methods_on_fold_for_class_RAPIDS, X_data = sepsis_data$X_data, y_data = sepsis_data$y_data, folds = sepsis_folds, log = T, scale = F, weights = T, met = 'dev', pivot = 2)
+
+
+saveRDS(object = kfold_results_unweighted, file = 'output/RAPIDS_kfold_results_unweighted.Rds')
+saveRDS(object = kfold_results_weighted, file = 'output/RAPIDS_kfold_results_weighted.Rds')
+```
+
+#Load Alvez data
+```{r}
+alvez_data <- readRDS('../input/alvez_data/alvez_data.prepd.Rds')
+alvez_X <- alvez_data$data
+alvez_y <- alvez_data$y
+```
+
+
+#Alvez dataset
+```{r}
+
+family = 'multinomial'
+measure = 'deviance'
+options('family' = family)
+
+fold_structure <- list('nfeatures' = numeric(), 'selected_features' = vector(), 'train_acc' = numeric(), 
+                       'test_acc' = numeric(), 
+                       'nsamples_test' = numeric(), 'true' = vector(), 'fitted' = vector(), 'fitted_probs' = data.frame(), 
+                       'test_idx' = vector(), 'weights' = vector(), 'model' = NULL)
+
+set.seed(42)
+folds <- caret::createFolds(y = alvez_y, k =5)
+
+run_methods_on_fold_for_class_Alvez <- function(i, X_data, y_data, folds, log = FALSE, scale = FALSE, weights = FALSE, met = 'dev', pivot) {
+   if (!(met %in% c("rms", "auc", "acc", "dev"))) { #should introduce multinomial deviance as a training metric
+    stop("Invalid value for 'option'. Choose 'rms', 'auc', 'acc', or 'dev'.")
+  }
+  
+  fold_results <- list() #will have 4 entries for each method, and two entries for each evaluation: one for min and one for 1se
+  
+    #-----------Prepare data folds---------------#
+  
+  #IDs for train and fold partitions
+  train_idx <- folds[-i] %>% unlist()
+  test_idx <- folds[[i]]
+  
+  #retrieve training samples
+  trainx <-  X_data[train_idx,] %>%
+    { if(log) log1p(.) else .} %>% 
+    {if (scale) scale(.) else .} 
+  
+  #impute missing
+  imputation_model <- caret::preProcess(trainx, method = 'knnImpute',k=10)
+  trainx <- predict(imputation_model, trainx)
+  
+  #tretrieve testing samples and impute missing from model of trainx
+  testx <- X_data[test_idx,] %>%
+    { if(log) log1p(.) else .} %>% 
+    {if (scale) scale(.) else .} 
+  
+  testx <- predict(imputation_model, testx)
+  
+  #retreive test and train y data and encode as numeric
+  trainy <-y_data[train_idx] %>% as.factor() %>% as.numeric()-1
+  testy <- y_data[test_idx] %>% as.factor() %>% as.numeric()-1 
+  
+  #calculate sample weights
+  training_class_weights <- (1/prop.table(table(trainy))) %>% {./sum(.)}
+  case_weights <- training_class_weights[as.character(trainy)]
+  
+  if (weights == F) { case_weights = NULL }
+  
+  #-----------FSPLS---------------#
+  fold_results$fspls <- list()
+  
+  fspls_train_data <- list(data = as.matrix(trainx), y = as.matrix(trainy))
+  fspls_test_data <- list(data = as.matrix(testx), y = as.matrix(testy))
+  #family is inferred from getOption. Think it's wiser to set family as an argument.
+  
+  #set minimum of 10 features if samples are weighted.
+  if(weights == F) {min_feats = 10}  else {min_feats = 2}
+  
+  model_fspls <- trainModel(trainOriginal = fspls_train_data, pv_thresh = pv_thresh, testOriginal = fspls_test_data, refit =refit, max = 10, min = min_feats, pivot = pivot, weights = case_weights) #pivot is treated as string by 'relevel' function
+
+  #which variable number to choose? Borrowing from glmnet's 1se idea
+  metric_col <- which(c('rms','auc','acc', 'dev') == met)
+  train_col_metric <- metric_col + 1
+  test_col_metric <- train_col_metric + 5
+  
+  evals <- model_fspls$eval[2:(length(model_fspls$variables)+1),train_col_metric] #index for corresponds to training accuracy
+
+  eval_min <- max(evals)
+  eval_se <- sd(evals)
+  if (length(model_fspls$variables) < 3) {
+    tolerable_acc = eval_min
+  } else{
+      tolerable_acc <- eval_min - eval_se
+  }
+  n_variables_min= which(evals == eval_min)[1]
+  n_variables_1se = which(evals >= tolerable_acc)[1]
+
+  n_variables_min = max(n_variables_min, min_feats)
+  n_variables_1se = max(n_variables_1se, min_feats)
+
+  #fspls preds
+  #preprocess test data to add 'levs' attribute and set pivot level
+  test = preprocess(fspls_test_data, centralise = FALSE, pivot=pivot) #make sure pivot matches that used in `trainModel`
+
+  #eval at min features
+  test_response_min <- pred(model_fspls$beta[1:n_variables_min,], 
+                          model_fspls$variables[1:n_variables_min], 
+                          const = model_fspls$constantTerm, 
+                          Wall = model_fspls$Wall[1:n_variables_min, 1:n_variables_min], 
+                          data= test, 
+                          means = model_fspls$means[1:n_variables_min])
+  test_preds_min <- liability(test_response_min)
+  
+    test_response_min_return <- cbind(1, exp(test_response_min)) %>% `colnames<-`(attr(test_response_min, 'levs')) %>% {apply(., 1, .prob)} %>% t()
+
+
+  fspls_best_feature_list_min <- colnames(testx)[model_fspls$variables[1:n_variables_min]]
+
+  fold_results$fspls$min = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                              list(n_variables_min, #number of variables
+                                   fspls_best_feature_list_min %>% paste(collapse = ';'), #variable names
+                                   evals[n_variables_min], #train metric
+                                   model_fspls$eval[n_variables_min+1,test_col_metric], #test metric
+                                   length(testy), #number of samples
+                                   testy, #true test values
+                                   as.numeric(test_preds_min), #fitted values (class)
+                                   test_response_min_return, #fitted probabilities
+                                   test_idx, #sample ids used for test
+                                   case_weights, #weights used in training
+                                   model_fspls),  #store the model
+                              SIMPLIFY = F)
+  
+  #eval at 1se features
+  test_response_1se <- pred(model_fspls$beta[1:n_variables_1se,], 
+                          model_fspls$variables[1:n_variables_1se], 
+                          const = model_fspls$constantTerm, 
+                          Wall = model_fspls$Wall[1:n_variables_1se, 1:n_variables_1se], 
+                          data= test, 
+                          means = model_fspls$means[1:n_variables_1se])
+  test_preds_1se <- liability(test_response_1se)
+  
+  test_response_1se_return <- cbind(1, exp(test_response_1se)) %>% `colnames<-`(attr(test_response_1se, 'levs')) %>% {apply(.,1, .prob)} %>% t()
+
+  fspls_best_feature_list_1se <- colnames(testx)[model_fspls$variables[1:n_variables_1se]]
+
+  fold_results$fspls$`1se` = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                              list(n_variables_1se, #number of variables
+                                   fspls_best_feature_list_1se %>% paste(collapse = ';'),#variable names
+                                   evals[n_variables_1se],#train metric
+                                   model_fspls$eval[n_variables_1se+1,test_col_metric],#test metric
+                                   length(testy),#number of samples
+                                   testy,#true test values
+                                   as.numeric(test_preds_1se),#fitted values (class)
+                                   test_response_1se_return,#fitted probabilities
+                                   test_idx,#sample ids used for test
+                                   case_weights, #weights used in training
+                                   model_fspls),  #store the model
+
+                              SIMPLIFY = F)
+    
+  
+  #-----------LASSO---------------#
+  fold_results$lasso <- list()
+  lasso_cv <- cv.glmnet(trainx, trainy, type.measure = measure, family = family, nfolds = 5, weights = case_weights)
+  #eval_lasso <- assess.glmnet(lasso_cv, newx = testx, newy = testy)
+  
+  #eval at min
+  lasso_test_preds_min <- predict(lasso_cv, newx = testx, s = 'lambda.min', type = 'response')
+  lasso_test_classes_min <- predict(lasso_cv, newx = testx, s = 'lambda.min', type = 'class')
+  lasso_test_assess_min <- assess.glmnet(lasso_cv, newx = testx, newy = testy, family = family)
+
+  lasso_nonzero_all_classes_min <- lapply(coef(lasso_cv, 'lambda.min'), function(x) which(x != 0)) %>% unlist() %>% unique() -1 #subtract one because intercept is always included first
+ 
+ fold_results$lasso$min = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                               list(length(lasso_nonzero_all_classes_min)-1, #subtract 1 to exclude intercept from count
+                                    colnames(testx)[lasso_nonzero_all_classes_min] %>% paste(collapse = ';'),
+                                    1-lasso_cv$cvm[lasso_cv$index['min',]],
+                                    1-lasso_test_assess_min$class[1], #do 1-measure for these - it's inacuracy it measures
+                                    length(testy),
+                                    testy,
+                                    as.numeric(lasso_test_classes_min),
+                                    as.data.frame(lasso_test_preds_min[,,1]) %>% 
+                                      dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                    test_idx,
+                                    case_weights, #weights used in training
+                                    lasso_cv),  
+                              SIMPLIFY = F)
+  
+ #eval at 1se 
+  lasso_test_preds_1se <- predict(lasso_cv, newx = testx, s = 'lambda.1se', type = 'response')
+  lasso_test_classes_1se <- predict(lasso_cv, newx = testx, s = 'lambda.1se', type = 'class')
+  lasso_test_assess_1se <- assess.glmnet(lasso_cv, newx = testx, newy = testy, family = family)
+
+  lasso_nonzero_all_classes_1se <- lapply(coef(lasso_cv, 'lambda.1se'), function(x) which(x != 0)) %>% 
+    unlist() %>% unique() -1 #subtract one because intercept is always included first
+ 
+ fold_results$lasso$`1se` = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                             list(length(lasso_nonzero_all_classes_1se)-1, #subtract 1 to exclude intercept from count
+                                  colnames(testx)[lasso_nonzero_all_classes_1se] %>% paste(collapse = ';'),
+                                  1-lasso_cv$cvm[lasso_cv$index['1se',]],
+                                  1-lasso_test_assess_1se$class[1], #do 1-measure for these - it's inacuracy it measures
+                                  length(testy),
+                                  testy,
+                                  as.numeric(lasso_test_classes_1se),
+                                  as.data.frame(lasso_test_preds_1se[,,1]) %>% 
+                                    dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                  test_idx,
+                                  case_weights, #weights used in training
+                                  lasso_cv),  
+                              SIMPLIFY = F)
+ 
+ #-----------Elastic-Net---------------#
+  fold_results$enet <- list()
+  
+  elasticnet_cv <- cv.glmnet(trainx, trainy, type.measure = measure, family = family, nfolds = 5, weights = case_weights, 
+                             alpha = 0.5)
+  
+  #eval at min
+  enet_test_preds_min <- predict(elasticnet_cv, newx = testx, s = 'lambda.min', type = 'response')
+  enet_test_classes_min <- predict(elasticnet_cv, newx = testx, s = 'lambda.min', type = 'class')
+  enet_test_assess_min <- assess.glmnet(elasticnet_cv, newx = testx, newy = testy, family = family)
+
+  enet_nonzero_all_classes_min <- lapply(coef(elasticnet_cv, 'lambda.min'), function(x) which(x != 0)) %>% 
+    unlist() %>% unique() -1 #subtract one because intercept is always included first
+ 
+ fold_results$enet$min = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                               list(length(enet_nonzero_all_classes_min)-1, #subtract 1 to exclude intercept from count
+                                    colnames(testx)[enet_nonzero_all_classes_min] %>% paste(collapse = ';'),
+                                    1-elasticnet_cv$cvm[elasticnet_cv$index['min',]],
+                                    1-enet_test_assess_min$class[1], #do 1-measure for these - it's inacuracy it measures
+                                    length(testy),
+                                    testy,
+                                    as.numeric(enet_test_classes_min),
+                                    as.data.frame(enet_test_preds_min[,,1]) %>% 
+                                      dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                    test_idx,
+                                    case_weights, #weights used in training
+                                    elasticnet_cv),  
+                              SIMPLIFY = F)
+  
+ #eval at 1se 
+  enet_test_preds_1se <- predict(elasticnet_cv, newx = testx, s = 'lambda.1se', type = 'response')
+  enet_test_classes_1se <- predict(elasticnet_cv, newx = testx, s = 'lambda.1se', type = 'class')
+  enet_test_assess_1se <- assess.glmnet(elasticnet_cv, newx = testx, newy = testy, family = family)
+
+  enet_nonzero_all_classes_1se <- lapply(coef(elasticnet_cv, 'lambda.1se'), function(x) which(x != 0)) %>% 
+    unlist() %>% unique() -1 #subtract one because intercept is always included first
+ 
+ fold_results$enet$`1se` = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                             list(length(enet_nonzero_all_classes_1se)-1, #subtract 1 to exclude intercept from count
+                                  colnames(testx)[enet_nonzero_all_classes_1se] %>% paste(collapse = ';'),
+                                  1-elasticnet_cv$cvm[elasticnet_cv$index['1se',]],
+                                  1-enet_test_assess_1se$class[1], #do 1-measure for these - it's inacuracy it measures
+                                  length(testy),
+                                  testy,
+                                  as.numeric(enet_test_classes_1se),
+                                  as.data.frame(enet_test_preds_1se[,,1]) %>% 
+                                    dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                  test_idx,
+                                  case_weights, #weights used in training
+                                  elasticnet_cv),  
+                              SIMPLIFY = F)
+ 
+  #-----------MRMR---------------#
+ 
+ fold_results$mrmr <- list()
+ 
+  mrmr_train_fold <- cbind(trainx, target  = as.numeric(trainy)) %>% as.data.frame()
+  mr.d <- mRMR.data(mrmr_train_fold)
+  
+  #eval at min
+  
+  mr_out_min <- mRMR.classic(mr.d, target_indices = c(length(mrmr_train_fold)), 
+                             feature_count = n_variables_min) #num of features from fspls
+  
+  mrmr_selected_min <- mrmr_train_fold[,solutions(mr_out_min)[[1]]]
+  
+  if (is.null(dim(mrmr_selected_min))) {
+    subset_x_data_test <- cbind(testx[,solutions(mr_out_min)[[1]]], 1)
+    mrmr_selected_min <- cbind(mrmr_selected_min, runif(n = nrow(trainx), min = 0.99, max = 1.01)) #add contant features (ones +- var) in case of just one feature being selected
+    colnames(mrmr_selected_min)[1] <- colnames(mrmr_train_fold)[solutions(mr_out_min)[[1]]]
+  } else {
+    subset_x_data_test <- testx[,colnames(mrmr_selected_min)]
+  }
+  
+  mrmr_ridge_min <- cv.glmnet(x = as.matrix(mrmr_selected_min), y = as.factor(trainy), family = family, alpha = 0, 
+                              type.measure = measure, nfolds = 5, weights = case_weights) 
+  
+
+  mrmr_test_preds_min <- predict(mrmr_ridge_min, newx  = testx[,colnames(subset_x_data_test)], s = 'lambda.1se', 
+                             type = 'response')
+  mrmr_test_classes_min <- predict(mrmr_ridge_min, newx  = testx[,colnames(subset_x_data_test)], s = 'lambda.1se', 
+                             type = 'class')
+  mrmr_test_assess_min <- assess.glmnet(mrmr_ridge_min, newx = testx[,colnames(subset_x_data_test)], 
+                                    newy = testy, family = family)
+
+
+  
+  fold_results$mrmr$min = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                                          list(n_variables_min,
+                                            colnames(mrmr_selected_min)[1:n_variables_min] %>% paste(collapse = ';'),
+                                           1 - mrmr_ridge_min$cvm[mrmr_ridge_min$index['1se',]],
+                                           1 - mrmr_test_assess_min$class[1], #do 1-measure for these - it's inacuracy it measures
+                                           length(testy),
+                                           testy,
+                                           as.numeric(mrmr_test_classes_min),
+                                           as.data.frame(mrmr_test_preds_min[,,1]) %>% 
+                                             dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                          test_idx,
+                                           case_weights,
+                                           mrmr_ridge_min),  
+                                   SIMPLIFY = F)
+ 
+  #eval at 1se
+  
+    mr_out_1se <- mRMR.classic(mr.d, target_indices = c(length(mrmr_train_fold)), 
+                             feature_count = n_variables_1se) #num of features from fspls
+  
+  mrmr_selected_1se <- mrmr_train_fold[,solutions(mr_out_1se)[[1]]]
+  
+  if (is.null(dim(mrmr_selected_1se))) {
+    subset_x_data_test <- cbind(testx[,solutions(mr_out_1se)[[1]]], 1)
+    mrmr_selected_1se <- cbind(mrmr_selected_1se, runif(n = nrow(trainx), min = 0.99, max = 1.01)) #add contant features (ones +- var) in case of just one feature being selected
+    colnames(mrmr_selected_1se) <- c(colnames(mrmr_train_fold)[solutions(mr_out_1se)[[1]]], 'null_feature')
+    #colnames(subset_x_data_test) <- colnames(mrmr_selected_1se)
+  } else {
+    subset_x_data_test <- testx[,colnames(mrmr_selected_1se)]
+  }
+  
+  mrmr_ridge_1se <- cv.glmnet(x = as.matrix(mrmr_selected_1se), y = as.factor(trainy), family = family, alpha = 0, 
+                              type.measure = measure, nfolds = 5) 
+  
+  mrmr_test_preds_1se <- predict(mrmr_ridge_1se, newx  = subset_x_data_test, s = 'lambda.1se', 
+                             type = 'response')
+  mrmr_test_classes_1se <- predict(mrmr_ridge_1se, newx  = subset_x_data_test, s = 'lambda.1se', 
+                             type = 'class')
+  mrmr_test_assess_1se <- assess.glmnet(mrmr_ridge_1se, newx = subset_x_data_test, 
+                                    newy = testy, family = family)
+
+
+  fold_results$mrmr$`1se` = mapply(FUN = function(x,y) x <- y , fold_structure, 
+                                          list(n_variables_1se,
+                                            colnames(mrmr_selected_1se)[1:n_variables_1se] %>% paste(collapse = ';'),
+                                           1 - mrmr_ridge_1se$cvm[mrmr_ridge_1se$index['1se',]],
+                                           1 - mrmr_test_assess_1se$class[1], #do 1-measure for these - it's inacuracy it measures
+                                           length(testy),
+                                           testy,
+                                           as.numeric(mrmr_test_classes_1se),
+                                           as.data.frame(mrmr_test_preds_1se[,,1]) %>% 
+                                             dplyr::select( rlang::sym(as.character(pivot)), everything()), #columns in same order as fspls
+                                           test_idx,
+                                           case_weights,
+                                           mrmr_ridge_1se),  
+                                   SIMPLIFY = F)
+  
+  
+  return(fold_results)
+}
+
+proteomics_kfold_results_unweighted <- mclapply(X = as.list(1:5), FUN = run_methods_on_fold_for_class_Alvez, alvez_X, alvez_y, folds, met = 'dev', weights = F, pivot = 2)
+proteomics_kfold_results_weighted <- mclapply(X = as.list(1:5), FUN = run_methods_on_fold_for_class_Alvez, alvez_X, alvez_y, folds, met = 'dev', weights = T, pivot = 2)
+
+saveRDS(proteomics_kfold_results_unweighted, 'output/alvez_kfold_results_unweighted.Rds')
+saveRDS(proteomics_kfold_results_weighted, 'output/alvez_kfold_results_weighted.Rds')
+```
+

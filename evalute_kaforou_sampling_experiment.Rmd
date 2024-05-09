@@ -1,0 +1,30 @@
+```{r}
+library(dplyr)
+library(ggplot2)
+```
+
+
+```{r}
+sampling_results <- readRDS('output/kaf_downsample_experiment_aucs.Rds')
+#each row is an iteration with a given number of samples aken randomly
+
+n_iter = 20
+samp_sizes = round(seq(0,1, 0.05) * 290)[-1]
+
+sampling_results <- mapply(function(x, y) {
+  colnames(x) <- 1:n_iter
+  x$n_samples <- samp_sizes
+
+  x <- tidyr::pivot_longer(x, cols = 1:20, names_to = 'sample_iteration', values_to = 'auc') %>% mutate(n_samples = as.factor(n_samples))
+  x$method = y
+  x
+}, sampling_results, names(sampling_results), SIMPLIFY = F)
+
+both_methods_sampling_results <- do.call(rbind, sampling_results)
+
+ggplot(both_methods_sampling_results, aes(x = n_samples, y =auc,  color = method)) + 
+  geom_boxplot(outlier.stroke = NA) + geom_smooth(aes(x= n_samples, y = auc, group = method)) + theme_minimal() + 
+  ggtitle('AUC of FS-PLS classifiers for Kaforou data, by n_of samples including in training') + theme(title = element_text(size = 8), axis.text.x = element_text(angle = 40, vjust = 00, hjust=0))
+ggsave('plots/kaforou_sampling_experiment_results.pdf', height = 3, width = 7)
+```
+

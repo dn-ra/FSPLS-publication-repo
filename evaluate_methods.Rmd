@@ -1,0 +1,241 @@
+---
+title: "evaluate methods"
+author: "Daniel Rawlinson"
+date: "2024-05-02"
+output: html_document
+---
+#Libraries
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+library(pROC)
+```
+
+#Binary results
+```{r}
+golub_results <- readRDS('output/golub_kfold_results.Rds')
+kaforou_results <- readRDS('output/kaforou_kfold_results.Rds')
+ng_results <- readRDS('output/ng_kfold_results.Rds')
+
+all_binary <- list('golub' = golub_results, 'kaforou' = kaforou_results, 'ng' = ng_results)
+
+binary_aucs <- lapply(all_binary, function(x) lapply(x, function(y) as.numeric(y$test_auc)) ) %>% data.frame(., kfold = paste0('kfold.',1:5)) %>% tidyr::pivot_longer(cols = !kfold, names_to = 'data_method', values_to = 'auc') %>% tidyr::separate(data_method, into = c("data", "method"), sep = "\\.") %>% tidyr::pivot_wider(id_cols = c(data, method), names_from = kfold, values_from = auc) %>% rowwise() %>% mutate(mean_auc = mean(c_across(starts_with('kfold.'))))
+
+binary_nFeatures <-  lapply(all_binary, function(x) lapply(x, function(y) as.numeric(y$nfeatures)) ) %>% data.frame(., kfold = paste0('kfold.',1:5)) %>% tidyr::pivot_longer(cols = !kfold, names_to = 'data_method', values_to = 'nfeatures') %>% tidyr::separate(data_method, into = c("data", "method"), sep = "\\.") %>% tidyr::pivot_wider(id_cols = c(data, method), names_from = kfold, values_from = nfeatures) %>% rowwise() %>% mutate(mean_nfeatures = mean(c_across(starts_with('kfold.'))))
+
+
+auc_long <- binary_aucs %>% dplyr::select(-mean_auc) %>% mutate(measure = 'auc') %>% tidyr::pivot_longer(cols = starts_with('kfold'))
+nFeature_long <- binary_nFeatures %>% dplyr::select(-mean_nfeatures) %>% mutate(measure = 'nFeatures') %>% tidyr::pivot_longer(cols = starts_with('kfold'))
+
+binary_together <- rbind(auc_long, nFeature_long) %>% group_by(data, method, measure) %>% 
+  summarise(mean = mean(value),
+            se = sd(value) / sqrt(n()),
+            margin = 1.96 * se,
+            upper = mean + margin,
+            lower = mean - margin)
+
+#limit upper bondary to 1 for auc
+binary_together %<>% mutate(upper = case_when(upper > 1 & measure == 'auc' ~ 1, .default = upper))
+
+ggplot(binary_together, aes(x = data, y = mean, color = method, ymin = lower, ymax = upper)) + geom_point(position = position_dodge(0.4)) + geom_errorbar(position = position_dodge(0.4), width = .6) + facet_wrap(~measure, scales = 'free')
+```
+
+#multi-class results
+```{r}
+#RAPIDS
+RAPIDS_fold_results_unweighted <- readRDS('output/RAPIDS_kfold_results_unweighted.Rds')
+RAPIDS_fold_results_weighted <- readRDS('output/RAPIDS_kfold_results_weighted.Rds')
+
+auc_dfs_unweighted <- list()
+num_features_list_unweighted <- list()
+for (method in names(RAPIDS_fold_results_unweighted[[1]])) {
+  
+  #model_1se <-  lapply( fold_results_unweighted, function(x) x[[method]]$`1se`)
+  model_min <- lapply( RAPIDS_fold_results_unweighted, function(x) x[[method]]$min)
+  
+  #these are per-fold multiclass AUCs.
+  #roc_1se <- lapply(model_1se, function(x) multiclass.roc(x$true, x$fitted_probs) )
+  roc_min <- lapply(model_min, function(x) multiclass.roc(x$true, x$fitted_probs) )
+  
+  #auc_1se <- do.call(rbind, lapply(roc_1se, '[', 'auc')) %>% as.numeric()
+  auc_min <- do.call(rbind, lapply(roc_min, '[', 'auc')) %>% as.numeric()
+  
+  auc_dfs_unweighted[[method]] <- auc_min
+  num_features_list_unweighted[[method]] <- lapply(RAPIDS_fold_results_unweighted, function(x) x[[method]]$min$nfeatures) %>% unlist()
+}
+
+auc_dfs_weighted <- list()
+num_features_list_weighted <- list()
+for (method in names(RAPIDS_fold_results_weighted[[1]])) {
+  
+  #model_1se <-  lapply( fold_results_weighted, function(x) x[[method]]$`1se`)
+  model_min <- lapply( RAPIDS_fold_results_weighted, function(x) x[[method]]$min)
+  
+  #these are per-fold multiclass AUCs.
+  #roc_1se <- lapply(model_1se, function(x) multiclass.roc(x$true, x$fitted_probs) )
+  roc_min <- lapply(model_min, function(x) multiclass.roc(x$true, x$fitted_probs) )
+  
+  #auc_1se <- do.call(rbind, lapply(roc_1se, '[', 'auc')) %>% as.numeric()
+  auc_min <- do.call(rbind, lapply(roc_min, '[', 'auc')) %>% as.numeric()
+  
+  auc_dfs_weighted[[method]] <- auc_min
+  num_features_list_weighted[[method]] <- lapply(RAPIDS_fold_results_weighted, function(x) x[[method]]$min$nfeatures) %>% unlist()
+}
+
+
+auc_df_unweighted <- do.call(rbind, auc_dfs_unweighted)['fspls',]
+auc_df_weighted <- do.call(rbind, auc_dfs_weighted)[c('lasso','enet','mrmr'),]
+aucs_coin <- data.frame(rbind(fspls = auc_df_unweighted, auc_df_weighted)) %>% mutate(measure = 'auc') %>% tibble::rownames_to_column('method')
+
+nFeats_df_unweighted <- do.call(rbind, num_features_list_unweighted)['fspls',]
+nFeats_df_weighted <- do.call(rbind, num_features_list_weighted)[c('lasso','enet','mrmr'),]
+nFeats_coin <- data.frame(rbind(fspls = nFeats_df_unweighted, nFeats_df_weighted)) %>% `colnames<-`(paste0('X',1:5)) %>% mutate(measure = 'nFeatures') %>% tibble::rownames_to_column('method')
+
+RAPIDS_summarised <- rbind(aucs_coin, nFeats_coin) %>% mutate(data = 'rapids') %>% tidyr::pivot_longer(starts_with('X')) %>% group_by(method, measure, data) %>% summarise(mean = mean(value),
+            se = sd(value) / sqrt(n()),
+            margin = 1.96 * se,
+            upper = mean + margin,
+            lower = mean - margin) %>% 
+  mutate(upper = case_when(upper > 1 & measure == 'auc' ~ 1, .default = upper))
+
+full_join(binary_together, RAPIDS_summarised)
+
+#ALVEZ
+Alvez_fold_results_unweighted <- readRDS('output/alvez_kfold_results_unweighted.Rds')
+Alvez_fold_results_weighted <- readRDS('output/alvez_kfold_results_weighted.Rds')
+
+auc_dfs_unweighted <- list()
+num_features_list_unweighted <- list()
+for (method in names(Alvez_fold_results_unweighted[[1]])) {
+  
+  #model_1se <-  lapply( fold_results_unweighted, function(x) x[[method]]$`1se`)
+  model_min <- lapply( Alvez_fold_results_unweighted, function(x) x[[method]]$min)
+  
+  #these are per-fold multiclass AUCs.
+  #roc_1se <- lapply(model_1se, function(x) multiclass.roc(x$true, x$fitted_probs) )
+  roc_min <- lapply(model_min, function(x) multiclass.roc(x$true, x$fitted_probs) )
+  
+  #auc_1se <- do.call(rbind, lapply(roc_1se, '[', 'auc')) %>% as.numeric()
+  auc_min <- do.call(rbind, lapply(roc_min, '[', 'auc')) %>% as.numeric()
+  
+  auc_dfs_unweighted[[method]] <- auc_min
+  num_features_list_unweighted[[method]] <- lapply(Alvez_fold_results_unweighted, function(x) x[[method]]$min$nfeatures) %>% unlist()
+}
+
+auc_dfs_weighted <- list()
+num_features_list_weighted <- list()
+for (method in names(Alvez_fold_results_weighted[[1]])) {
+  
+  #model_1se <-  lapply( fold_results_weighted, function(x) x[[method]]$`1se`)
+  model_min <- lapply( Alvez_fold_results_weighted, function(x) x[[method]]$min)
+  
+  #these are per-fold multiclass AUCs.
+  #roc_1se <- lapply(model_1se, function(x) multiclass.roc(x$true, x$fitted_probs) )
+  roc_min <- lapply(model_min, function(x) multiclass.roc(x$true, x$fitted_probs) )
+  
+  #auc_1se <- do.call(rbind, lapply(roc_1se, '[', 'auc')) %>% as.numeric()
+  auc_min <- do.call(rbind, lapply(roc_min, '[', 'auc')) %>% as.numeric()
+  
+  auc_dfs_weighted[[method]] <- auc_min
+  num_features_list_weighted[[method]] <- lapply(Alvez_fold_results_weighted, function(x) x[[method]]$min$nfeatures) %>% unlist()
+}
+
+
+auc_df_unweighted <- do.call(rbind, auc_dfs_unweighted)['fspls',]
+auc_df_weighted <- do.call(rbind, auc_dfs_weighted)[c('lasso','enet','mrmr'),]
+aucs_alvez <- data.frame(rbind(fspls = auc_df_unweighted, auc_df_weighted)) %>% mutate(measure = 'auc') %>% tibble::rownames_to_column('method')
+
+nFeats_df_unweighted <- do.call(rbind, num_features_list_unweighted)['fspls',]
+nFeats_df_weighted <- do.call(rbind, num_features_list_weighted)[c('lasso','enet','mrmr'),]
+nFeats_alvez <- data.frame(rbind(fspls = nFeats_df_unweighted, nFeats_df_weighted)) %>% `colnames<-`(paste0('X',1:5)) %>% mutate(measure = 'nFeatures') %>% tibble::rownames_to_column('method')
+
+alvez_summarised <- rbind(aucs_alvez, nFeats_alvez) %>% mutate(data = 'alvez') %>% tidyr::pivot_longer(starts_with('X')) %>% group_by(method, measure, data) %>% summarise(mean = mean(value),
+            se = sd(value) / sqrt(n()),
+            margin = 1.96 * se,
+            upper = mean + margin,
+            lower = mean - margin) %>% 
+  mutate(upper = case_when(upper > 1 & measure == 'auc' ~ 1, .default = upper))
+
+all_data_kfold_results <- Reduce(full_join, list(binary_together, RAPIDS_summarised, alvez_summarised)) %>% mutate(method = stringr::str_replace(method, 'enet', 'elastic_net')) %>% mutate(data = factor(data, levels = c('golub','ng','kaforou','rapids','alvez')))
+
+```
+#plot Features
+```{r}
+ggplot(all_data_kfold_results %>% filter(measure == 'nFeatures', method != 'mrmr'), aes(x = method, y = mean, color = data, ymin = lower, ymax = upper)) + geom_point(position = position_dodge(0.4)) + geom_errorbar(position = position_dodge(0.4), width = .6) + facet_wrap(~measure, scales = 'free') + scale_color_discrete(labels = c('Golub (n=57)','Ng (n=206)','Kaforou (n=289)','RAPIDS (n=431)','Alvez (n=1181)')) + theme_minimal()
+
+ggsave('plots/all_data_all_methods_kfold_nFeatures.pdf', height = 4)
+```
+#Stagewise FS results
+```{r}
+stagewise_files <- list(golub = 'output/golub_forward.stagewise_aucs.Rds', kaf = 'output/kaf_forward.stagewise_aucs.Rds', Ng = 'output/Ng_forward.stagewise_aucs.Rds')
+aucs <- lapply(stagewise_files, readRDS)
+#aucs$golub <- aucs$golub$fs
+
+aucs <- do.call(cbind, aucs) %>% as.data.frame() 
+aucs$kfold <- paste0('kfold.', 1:5)
+aucs <- tidyr::pivot_longer(aucs, !kfold, names_to = 'data', values_to = 'auc') %>% mutate(auc = as.numeric(auc), method = 'stagewise')
+
+stagewise_auc_means <- aucs %>% group_by(method, data) %>% 
+          summarise(means = mean(auc),
+            se = sd(auc) / sqrt(n()),
+            margin = 1.96 * se,
+            upper = means + margin,
+            lower = means - margin) %>% 
+  mutate(upper = case_when(upper > 1  ~ 1, .default = upper))
+
+```
+
+
+#StepAIC results
+```{r}
+results_files <- list(coin = 'output/RAPIDS_stepAIC_results.Rds', alvez = 'output/alvez_stepAIC_results.Rds')
+results_data <- lapply(results_files, readRDS)
+
+
+kfold_probs <- lapply(results_data, function(x) x$pred_probs)
+kfold_true <- lapply(results_data, function(x) x$true_class)
+
+kfold_stepAIC_aucs <- mapply(function(probs, true) {
+    auc_list <- list()
+    for (i in 1:5) {
+      
+      #faux_binary_class <- true
+      #faux_binary_class[faux_binary_class != i] <- 'other'
+    
+      #auc_obj <- pROC::roc(faux_binary_class, as.numeric(probs[,i]), auc = T)
+      #auc_list[[i]] <- auc_obj$auc
+      
+      auc_list[[i]] <- pROC::multiclass.roc(true[[i]], probs[[i]])$auc
+      
+    }
+    return(auc_list)
+    }, kfold_probs, kfold_true,  SIMPLIFY = F)
+
+kfold_stepAIC_aucs <- do.call(cbind, lapply(kfold_stepAIC_aucs, as.numeric)) %>% as.data.frame %>% mutate(kfold = paste0('kfold.',1:5), method = 'stepAIC') %>% tidyr::pivot_longer(c(coin, alvez), names_to = 'data')
+
+multiclass_results <- kfold_stepAIC_aucs%>% group_by(method, data) %>% summarise(means = mean(value),
+            se = sd(value) / sqrt(n()),
+            margin = 1.96 * se,
+            upper = means + margin,
+            lower = means - margin) %>% 
+  mutate(upper = case_when(upper > 1  ~ 1, .default = upper))
+
+
+```
+#Bind all results and plot
+```{r}
+all_stagewise <- full_join(multiclass_results, stagewise_auc_means)
+
+all_data_final <- all_stagewise %>% mutate(measure = 'auc') %>% dplyr::rename(mean = means) %>% full_join(all_data_kfold_results) %>% mutate(data = replace(data, data == 'Ng', 'ng'), data = replace(data, data == 'coin', 'rapids'), data = replace(data, data == 'kaf', 'kaforou')) %>% mutate(data = factor(data, levels = c('golub','ng','kaforou','rapids','alvez')))
+
+
+
+
+ggplot(all_data_final %>% filter(measure == 'auc'), aes(x = method, y = mean, ymin = lower, ymax=upper, color = data)) + geom_point(position = position_dodge(width = 0.4)) + geom_errorbar(position = position_dodge(width = 0.4),width = 0.4)  + theme_minimal() + facet_wrap(~measure, scales ='free') + theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=1))
+
+ggsave(filename = 'plots/all_solutions_together_kfold_aucs_and_features.pdf',height = 4, width = 4.7)
+
+```
+
