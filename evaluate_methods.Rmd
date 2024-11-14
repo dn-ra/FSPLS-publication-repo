@@ -11,6 +11,8 @@ library(dplyr)
 library(tidyr)
 library(magrittr)
 library(pROC)
+library(RColorBrewer)
+suppressPackageStartupMessages(library(ComplexHeatmap))
 ```
 
 #Binary results
@@ -170,7 +172,7 @@ ggsave('plots/all_data_all_methods_kfold_nFeatures.pdf', height = 4)
 #Stagewise FS results
 ```{r}
 stagewise_files <- list(golub = 'output/golub_forward.stagewise_aucs.Rds', kaf = 'output/kaf_forward.stagewise_aucs.Rds', Ng = 'output/Ng_forward.stagewise_aucs.Rds')
-aucs <- lapply(stagewise_files, readRDS)
+aucs <- lapply(stagewise_files, function(x) readRDS(x)$aucs)
 #aucs$golub <- aucs$golub$fs
 
 aucs <- do.call(cbind, aucs) %>% as.data.frame() 
@@ -238,4 +240,73 @@ ggplot(all_data_final %>% filter(measure == 'auc'), aes(x = method, y = mean, ym
 ggsave(filename = 'plots/all_solutions_together_kfold_aucs_and_features.pdf',height = 4, width = 4.7)
 
 ```
+#Stage-wise vs FS-PLS feature correlation heatmaps (binary datasets)
+```{r}
+
+hm_color_scheme <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(100)
+hm_breaks <- seq(-1, 1, length.out = 101)
+stagewise_features <- lapply(stagewise_files, function(x) readRDS(x)$features)
+```
+
+##Kaforou data
+```{r}
+kaf_data <- readRDS('input/kaforou_data/kaforou_data.prepd.Rds')
+#match the trimming protocol from training
+vars_X <- kaf_data$data[kaf_data$TB_idx,] %>% {apply(., 2, var)} %>% sort(decreasing = T)
+x_data <- kaf_data$data  %>% scale()
+x_data <- x_data[,names(vars_X)[1:10000]]
+
+pdf('plots/feature_correlations_Kaforou.pdf', height = 3, width = 4)
+
+for (i in 1:5) {
+#stagewuse
+x_data.k.stagewise <- x_data[,stagewise_features$kaf[[i]]]
+cov.k.stagewise <- cov(x_data.k.stagewise)
+cov.k.stagewise[upper.tri(cov.k.stagewise)] <- NA
+hm_sw <- pheatmap(cov.k.stagewise, display_numbers = T, cluster_rows = F, cluster_cols = F,
+                  breaks = hm_breaks, color = hm_color_scheme, na_col = 'white', fontsize = 8, cellwidth = 27.210, cellheight = 24.860)
+draw(hm_sw)
+#FSPLS
+x_data.k.fspls <- x_data[,stringr::str_split_1(kaforou_results$fspls$feature_ids[i], ';')]
+cov.k.fspls <- cov(x_data.k.fspls)
+cov.k.fspls[lower.tri(cov.k.fspls)] <- NA
+hm_fspls <- pheatmap(cov.k.fspls, display_numbers = T, cluster_rows = F, cluster_cols = F, 
+                     breaks = hm_breaks, color = hm_color_scheme, na_col = 'white', fontsize = 8, cellwidth = 27.210, cellheight = 24.860)
+draw(hm_fspls)
+}
+dev.off()
+```
+
+##Ng data
+```{r}
+ng_data <- readRDS('input/ng_data/ng_data.prepd.Rds')
+#match the trimming protocol from training
+vars_X <- ng_data$data %>% log1p() %>% {apply(., 2, var)} %>% sort(decreasing = T)
+ng_million_lib_sizes <- apply(ng_data$data, 1, sum) / 1e6
+
+ng_tpms <- sweep(ng_data$data, 1, STATS = ng_million_lib_sizes, FUN = '/')
+x_data <- ng_tpms[,names(vars_X)[1:10000]] %>% log1p() %>% scale()
+
+pdf('plots/feature_correlations_Ng.pdf', height = 3, width = 4)
+
+for (i in 1:5) {
+#stagewuse
+x_data.k.stagewise <- x_data[,stagewise_features$Ng[[i]]]
+cov.k.stagewise <- cov(x_data.k.stagewise)
+cov.k.stagewise[upper.tri(cov.k.stagewise)] <- NA
+hm_sw <- pheatmap(cov.k.stagewise, display_numbers = T, cluster_rows = F, cluster_cols = F, 
+                  breaks = hm_breaks, color = hm_color_scheme, na_col = "white", fontsize = 8, cellwidth = 27.210, cellheight = 24.860)
+draw(hm_sw)
+#FSPLS
+x_data.k.fspls <- x_data[,stringr::str_split_1(ng_results$fspls$feature_ids[i], ';')]
+cov.k.fspls <- cov(x_data.k.fspls)
+cov.k.fspls[lower.tri(cov.k.fspls)] <- NA
+hm_fspls <- pheatmap(cov.k.fspls, display_numbers = T, cluster_rows = F, cluster_cols = F, 
+                     breaks = hm_breaks, color = hm_color_scheme, na_col = 'white', fontsize = 8, cellwidth = 27.210, cellheight = 24.860)
+draw(hm_fspls)
+}
+
+dev.off()
+```
+
 

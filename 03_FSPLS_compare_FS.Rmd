@@ -26,8 +26,7 @@ golub_merged_x <- golub_data$data #total of 72 samples
 golub_merged_y <- golub_data$y
 
 auc_results <- list()
-auc_results <- list()
-
+selected_features <- list()
 
 set.seed(42)
 golub_folds <- caret::createFolds(y = golub_merged_y$x, k =5)
@@ -47,14 +46,14 @@ for (i in 1:length(golub_folds)) {
   golub.test.met <- predict(golub.fs, newx = fold_testx)
   
   auc_results[[i]] <-  pROC::auc(as.matrix(fold_testy), golub.test.met$fit[,3]) #set to same number of features
-  
+  selected_features[[i]] <- colnames(coef(golub.fs))[which(coef(golub.fs)[dim(golub.fs$beta)[1],] != 0)]
   #golub.fspls <- trainModel(list(data = fold_trainx, y = fold_trainy), testOriginal = list(data = fold_testx, y = fold_testy))
   
   
   #auc_results$fspls[[i]] <- golub.fspls$eval[3,8]
 }
 
-saveRDS(auc_results, file = 'output/golub_forward.stagewise_aucs_10_folds.Rds')
+saveRDS(list(aucs = auc_results, features = selected_features), file = 'output/golub_forward.stagewise_aucs.Rds')
 
 ```
 
@@ -70,6 +69,7 @@ folds <- caret::createFolds(y = kaf_data$TB_idx, k = 5)
 vars_X <- kaf_data$data[kaf_data$TB_idx,] %>% {apply(., 2, var)} %>% sort(decreasing = T)
 
 auc_results <- list()
+selected_features <- list()
 
 
 for (i in 1:5) {
@@ -93,10 +93,10 @@ for (i in 1:5) {
   test.met <- predict(fs, fold_testx)
   
   auc_results[[i]] <-  pROC::auc(as.matrix(fold_testy), test.met$fit[,7])
-  
+  selected_features[[i]] <- colnames(coef(fs))[which(coef(fs)[dim(fs$beta)[1],] != 0)]
 }
 
-saveRDS(auc_results, file = 'output/kaf_forward.stagewise_aucs.Rds')
+saveRDS(list(aucs = auc_results, features = selected_features), file = 'output/kaf_forward.stagewise_aucs.Rds')
 ```
 
 #Ng
@@ -113,7 +113,8 @@ log=T
 scale=F
 i =1
 
-aucs <- list()
+auc_results <- list()
+selected_features <- list()
 
 for (i in 1:length(folds)) {
 
@@ -141,14 +142,15 @@ testx_normalised <- sweep(testx, 1, STATS = lib.sizes_test_per_mill, FUN = '/') 
 #mod.step <- stepAIC(mod, trace = F, direction = 'forward')
 
 
-lars.mod <- lars(as.matrix(trainx_normalised), as.matrix(trainy), use.Gram = F, normalize = F, type = 'forward.stagewise', max.steps = 6)
+lars.mod <- lars(as.matrix(trainx_normalised), as.matrix(trainy), use.Gram = F, normalize = F, type = 'forward.stagewise', max.steps = 5)
 new_preds <- predict(lars.mod, testx_normalised)
 
-aucs[[i]] <- pROC::auc(response = testy, predictor = as.numeric(new_preds$fit[,5]))
+auc_results[[i]] <- pROC::auc(response = testy, predictor = as.numeric(new_preds$fit[,6]))
+selected_features[[i]] <- colnames(coef(lars.mod))[which(coef(lars.mod)[dim(lars.mod$beta)[1],] != 0)]
 
 }
 
-saveRDS(aucs, file = 'Ng_forward.stagewise_aucs.Rds')
+saveRDS(list(aucs = auc_results, features = selected_features), file = 'output/Ng_forward.stagewise_aucs.Rds')
 
 ```
 #RAPIDS
